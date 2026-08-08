@@ -10,7 +10,7 @@ app.use(cors());
 app.use(express.json());
 
 // Servir arquivos APK para download e atualização 100% direta
-const APKS_DIR = path.join(__dirname, '../apks');
+const APKS_DIR = path.join(__dirname, 'apks');
 if (!fs.existsSync(APKS_DIR)) {
   fs.mkdirSync(APKS_DIR, { recursive: true });
 }
