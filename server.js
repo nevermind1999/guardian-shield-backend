@@ -9,6 +9,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Servir arquivos APK para download e atualização 100% direta
+const APKS_DIR = path.join(__dirname, '../apks');
+if (!fs.existsSync(APKS_DIR)) {
+  fs.mkdirSync(APKS_DIR, { recursive: true });
+}
+app.use('/apks', express.static(APKS_DIR));
+
+app.get('/api/apks/latest', (req, res) => {
+  res.json({
+    parentApkUrl: 'https://guardian-shield.oguiazevedo.com/apks/GuardianShield-Pai.apk',
+    childApkUrl: 'https://guardian-shield.oguiazevedo.com/apks/GuardianShield-Filho.apk',
+    version: '1.1.0'
+  });
+});
+
 const DB_FILE = path.join(__dirname, 'database.json');
 
 // Carrega ou inicializa banco de dados em arquivo
