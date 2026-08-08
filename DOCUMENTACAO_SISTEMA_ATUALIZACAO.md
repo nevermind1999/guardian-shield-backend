@@ -136,6 +136,18 @@ app.get(['/api/download/pai', '/apks/GuardianShield-Pai.apk'], (req, res) => {
 
 ---
 
+### 5. Bloqueio Inviolável em Tela Cheia no Android (`SYSTEM_ALERT_WINDOW` & Persistent Lock)
+- **Problema**: Ao acionar a "Pausa Geral" ou quando o tempo diário expirava, o bloqueio aparecia apenas dentro do WebView. Se a criança minimizasse o app ou usasse a tecla Home, ela conseguia acessar o TikTok, YouTube, jogos e configurações normalmente. Além disso, o modo de fixação simples do Android (`startLockTask`) exibia uma mensagem do próprio sistema ensinando como desfixar o aplicativo.
+- **Solução Nativa Aplicada**:
+  1. **Janela de Sobreposição Nativa (`LockOverlayService.java`)**:
+     Criado o serviço `LockOverlayService` usando `WindowManager` com permissão de sobreposição de sistema (`TYPE_APPLICATION_OVERLAY`). Essa janela cobre **100% da tela do Android** com o aviso **"🔒 DISPOSITIVO BLOQUEADO"** por cima de qualquer aplicativo em execução (TikTok, YouTube, Jogos, Launcher, Configurações).
+  2. **Persistência em Disco (`SharedPreferences`)**:
+     O estado de bloqueio é gravado em `SharedPreferences` (`GuardianShieldPrefs`). O `ParentalAccessibilityService.kt` consulta essa chave em tempo real a cada alteração de janela no Android. Se a Pausa Geral estiver ativa, o serviço intercepta imediatamente e força o retorno para a tela de bloqueio.
+  3. **Remoção de Dicas do Sistema**:
+     Removida a fixação simples do Android para garantir que o sistema não dê dicas de desfixação.
+
+---
+
 ## 🏗️ Estrutura Final do Projeto
 
 ```
