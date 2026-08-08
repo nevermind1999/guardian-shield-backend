@@ -18,7 +18,7 @@ if (!fs.existsSync(APKS_DIR)) {
 app.get('/apks/GuardianShield-Filho.apk', (req, res) => {
   const localFile = path.join(APKS_DIR, 'GuardianShield-Filho.apk');
   if (fs.existsSync(localFile)) {
-    return res.sendFile(localFile);
+    return res.download(localFile, 'GuardianShield-Filho.apk');
   }
   res.redirect('https://github.com/nevermind1999/guardian-shield-kid/releases/latest/download/GuardianShield-Filho.apk');
 });
@@ -26,12 +26,15 @@ app.get('/apks/GuardianShield-Filho.apk', (req, res) => {
 app.get('/apks/GuardianShield-Pai.apk', (req, res) => {
   const localFile = path.join(APKS_DIR, 'GuardianShield-Pai.apk');
   if (fs.existsSync(localFile)) {
-    return res.sendFile(localFile);
+    return res.download(localFile, 'GuardianShield-Pai.apk');
   }
   res.redirect('https://github.com/nevermind1999/guardian-shield-parents/releases/latest/download/GuardianShield-Pai.apk');
 });
 
-app.use('/apks', express.static(APKS_DIR));
+app.use('/apks', (req, res, next) => {
+  res.setHeader('Content-Disposition', 'attachment');
+  next();
+}, express.static(APKS_DIR));
 
 app.get('/api/apks/latest', (req, res) => {
   res.json({
