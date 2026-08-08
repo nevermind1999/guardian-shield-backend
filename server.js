@@ -259,10 +259,11 @@ io.on('connection', (socket) => {
         dev.installedApps = installedApps;
         // Mescla novos apps sem perder status de bloqueio anterior
         installedApps.forEach(newApp => {
-          const existing = db.rules.blockedApps.find(a => a.id === newApp.id);
-          if (!existing) {
+          const appId = newApp.id || newApp.package;
+          const existing = db.rules.blockedApps.find(a => a.id === appId);
+          if (appId && !existing) {
             db.rules.blockedApps.push({
-              id: newApp.id,
+              id: appId,
               name: newApp.name,
               category: newApp.category || 'Aplicativos',
               isBlocked: false
