@@ -15,7 +15,7 @@ if (!fs.existsSync(APKS_DIR)) {
   fs.mkdirSync(APKS_DIR, { recursive: true });
 }
 
-app.get('/apks/GuardianShield-Filho.apk', (req, res) => {
+app.get(['/api/download/filho', '/apks/GuardianShield-Filho.apk'], (req, res) => {
   const localFile = path.join(APKS_DIR, 'GuardianShield-Filho.apk');
   if (fs.existsSync(localFile)) {
     return res.download(localFile, 'GuardianShield-Filho.apk');
@@ -23,7 +23,7 @@ app.get('/apks/GuardianShield-Filho.apk', (req, res) => {
   res.redirect('https://github.com/nevermind1999/guardian-shield-kid/releases/latest/download/GuardianShield-Filho.apk');
 });
 
-app.get('/apks/GuardianShield-Pai.apk', (req, res) => {
+app.get(['/api/download/pai', '/apks/GuardianShield-Pai.apk'], (req, res) => {
   const localFile = path.join(APKS_DIR, 'GuardianShield-Pai.apk');
   if (fs.existsSync(localFile)) {
     return res.download(localFile, 'GuardianShield-Pai.apk');
@@ -38,8 +38,8 @@ app.use('/apks', (req, res, next) => {
 
 app.get('/api/apks/latest', (req, res) => {
   res.json({
-    parentApkUrl: 'https://guardian-shield.oguiazevedo.com/apks/GuardianShield-Pai.apk',
-    childApkUrl: 'https://guardian-shield.oguiazevedo.com/apks/GuardianShield-Filho.apk',
+    parentApkUrl: 'https://guardian-shield.oguiazevedo.com/api/download/pai',
+    childApkUrl: 'https://guardian-shield.oguiazevedo.com/api/download/filho',
     version: '1.1.0'
   });
 });
