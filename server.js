@@ -212,9 +212,11 @@ io.on('connection', (socket) => {
 
   // Recebe dados REAIS de telemetria enviados pelo dispositivo do Filho
   socket.on('child:telemetry', (data) => {
-    const { deviceId, batteryLevel, usedMinutesToday, location, installedApps } = data;
+    const { deviceId, deviceName, deviceModel, batteryLevel, usedMinutesToday, location, installedApps } = data || {};
     if (deviceId && db.pairedDevices[deviceId]) {
       const dev = db.pairedDevices[deviceId];
+      if (deviceName) dev.name = deviceName;
+      if (deviceModel) dev.model = deviceModel;
       if (batteryLevel !== undefined) dev.batteryLevel = batteryLevel;
       if (usedMinutesToday !== undefined) dev.usedMinutesToday = usedMinutesToday;
       if (location) dev.location = location;
