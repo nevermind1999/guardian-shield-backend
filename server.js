@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -87,7 +88,15 @@ function loadDatabase() {
       // 'earn' = cada tarefa aprovada soma minutos ao dia; 'all_or_nothing' = aparelho
       // travado até todas as tarefas de hoje serem aprovadas.
       taskUnlockMode: 'off',
-      dailyTasks: [] // template: [{ id, title, icon, rewardMinutes }]
+      dailyTasks: [], // template: [{ id, title, icon, rewardMinutes }]
+      // PIN de emergência: só o hash SHA-256 é guardado, nunca o valor em texto puro
+      // (ver parent:set_unlock_pin) — o nativo sincroniza o hash e faz a checagem
+      // 100% offline no aparelho da criança (ver ParentalAccessibilityService.kt).
+      unlockPinHash: null,
+      lastPinUnlockAt: null,
+      // Setado por parent:request_location_update, consumido e zerado assim que o
+      // nativo reporta uma localização fresca em POST /api/device/location-sync.
+      locationUpdateRequested: false
     },
     // Status do dia corrente de cada tarefa do template acima — regenerado
     // automaticamente quando a data muda (ver ensureTasksForToday).
@@ -106,11 +115,14 @@ function saveDatabase(db) {
 
 let db = loadDatabase();
 
-// Backfill de bancos salvos antes da feature de tarefas existir, pra não quebrar
+// Backfill de bancos salvos antes de features mais novas existirem, pra não quebrar
 // leituras de um database.json antigo.
 if (db.rules.taskUnlockMode === undefined) db.rules.taskUnlockMode = 'off';
 if (!Array.isArray(db.rules.dailyTasks)) db.rules.dailyTasks = [];
 if (!db.taskInstances) db.taskInstances = { date: null, items: [] };
+if (db.rules.unlockPinHash === undefined) db.rules.unlockPinHash = null;
+if (db.rules.lastPinUnlockAt === undefined) db.rules.lastPinUnlockAt = null;
+if (db.rules.locationUpdateRequested === undefined) db.rules.locationUpdateRequested = false;
 
 function blankTaskItem(taskId) {
   return { taskId, status: 'pending', photoUrl: null, submittedAt: null, approvedAt: null, rejectedReason: null };
@@ -253,7 +265,11 @@ function getGlobalState() {
       usedMinutesToday: primaryChild.usedMinutesToday || 0,
       isPauseAllActive: db.rules.isPauseAllActive,
       bedtimeSchedule: db.rules.bedtimeSchedule,
-      studySchedule: db.rules.studySchedule
+      studySchedule: db.rules.studySchedule,
+      // O hash em si nunca é exposto pro app do pai, só se existe um cadastrado —
+      // o pai não precisa (nem deve) conseguir ler o PIN de volta.
+      hasUnlockPin: Boolean(db.rules.unlockPinHash),
+      lastPinUnlockAt: db.rules.lastPinUnlockAt
     },
     blockedApps: db.rules.blockedApps.length > 0 ? db.rules.blockedApps : (primaryChild.installedApps || []),
     contentFilter: db.rules.contentFilter,
@@ -303,8 +319,42 @@ app.get('/api/tasks/sync', (req, res) => {
     dailyTasks: db.rules.dailyTasks,
     todayStatus: db.taskInstances.items,
     isPauseAllActive: db.rules.isPauseAllActive,
-    blockedPackages: db.rules.blockedApps.filter(a => a.isBlocked).map(a => a.id)
+    blockedPackages: db.rules.blockedApps.filter(a => a.isBlocked).map(a => a.id),
+    // Hash SHA-256 do PIN de emergência (nunca o valor em texto puro) — o nativo
+    // guarda isso localmente e faz a checagem 100% offline (ver LockOverlayService).
+    unlockPinHash: db.rules.unlockPinHash,
+    locationUpdateRequested: db.rules.locationUpdateRequested
   });
+});
+
+// Chamado pelo nativo assim que consegue uma localização fresca (a cada tick normal,
+// ou logo depois de um pedido de atualização forçada — ver locationUpdateRequested
+// acima). Espelha reconcileInstalledApps, mas pra posição.
+app.post('/api/device/location-sync', (req, res) => {
+  const { latitude, longitude, accuracy } = req.body || {};
+  const dev = Object.values(db.pairedDevices)[0];
+  if (!dev || latitude == null || longitude == null) {
+    return res.json({ success: false });
+  }
+  dev.location = { latitude, longitude, accuracy, lastUpdated: new Date().toISOString() };
+  db.rules.locationUpdateRequested = false;
+  dev.lastSeen = new Date().toISOString();
+  dev.isOnline = true;
+  saveDatabase(db);
+  io.emit('state:update', getGlobalState());
+  res.json({ success: true });
+});
+
+// Chamado pelo nativo assim que a rede volta, depois de um desbloqueio local por PIN
+// enquanto o aparelho estava offline (ver pendingPinUnlockAck em GuardianPrefs.kt) —
+// só pra manter o painel do pai consistente com o que já aconteceu de verdade no
+// aparelho (a criança já foi desbloqueada localmente antes disso chegar aqui).
+app.post('/api/device/pin-unlock-ack', (req, res) => {
+  db.rules.isPauseAllActive = false;
+  db.rules.lastPinUnlockAt = new Date().toISOString();
+  saveDatabase(db);
+  io.emit('state:update', getGlobalState());
+  res.json({ success: true });
 });
 
 /**
@@ -471,6 +521,25 @@ io.on('connection', (socket) => {
 
   socket.on('parent:toggle_pause_all', (isPaused) => {
     db.rules.isPauseAllActive = isPaused;
+    saveDatabase(db);
+    io.emit('state:update', getGlobalState());
+  });
+
+  // PIN de emergência: só o hash SHA-256 é guardado — o valor em texto puro chega
+  // aqui (mesma proteção HTTPS de qualquer outro campo) mas nunca é persistido nem
+  // reenviado a ninguém. O nativo sincroniza o hash e compara localmente, offline.
+  socket.on('parent:set_unlock_pin', (pin) => {
+    const cleaned = String(pin || '').trim();
+    if (cleaned.length < 4 || cleaned.length > 8) return;
+    db.rules.unlockPinHash = crypto.createHash('sha256').update(cleaned).digest('hex');
+    saveDatabase(db);
+    io.emit('state:update', getGlobalState());
+  });
+
+  // Pede que o aparelho busque uma localização fresca (GPS ativo) no próximo poll,
+  // em vez de só reenviar a última posição em cache — ver locationUpdateRequested.
+  socket.on('parent:request_location_update', () => {
+    db.rules.locationUpdateRequested = true;
     saveDatabase(db);
     io.emit('state:update', getGlobalState());
   });
