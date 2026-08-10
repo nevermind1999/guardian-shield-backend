@@ -217,6 +217,21 @@ function computeEffectiveDailyLimitMinutes(db) {
   return db.rules.dailyLimitMinutes;
 }
 
+/**
+ * Distância em metros entre duas coordenadas (fórmula de Haversine) — usada pra
+ * calcular se a criança está dentro ou fora de uma cerca virtual (ver geofences em
+ * getGlobalState()).
+ */
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000; // raio da Terra em metros
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 function getGlobalState() {
   ensureTasksForToday(db);
   const devicesList = Object.values(db.pairedDevices);
@@ -248,7 +263,14 @@ function getGlobalState() {
       address: "São Paulo, SP",
       lastUpdated: new Date().toISOString()
     },
-    geofences: db.rules.geofences,
+    // Status calculado de verdade contra a posição atual da criança (antes era um
+    // valor fixo no seed, nunca recalculado) — 'unknown' se ainda não há GPS.
+    geofences: db.rules.geofences.map(gf => ({
+      ...gf,
+      status: primaryChild.location
+        ? (haversineMeters(primaryChild.location.latitude, primaryChild.location.longitude, gf.latitude, gf.longitude) <= gf.radiusMeters ? 'inside' : 'outside')
+        : 'unknown'
+    })),
     timeRequests: db.timeRequests,
     tasks: {
       unlockMode: db.rules.taskUnlockMode,
@@ -383,20 +405,21 @@ io.on('connection', (socket) => {
       if (batteryLevel !== undefined) dev.batteryLevel = batteryLevel;
       if (usedMinutesToday !== undefined) dev.usedMinutesToday = usedMinutesToday;
       if (location) dev.location = location;
-      if (installedApps && installedApps.length > 0) {
+      if (Array.isArray(installedApps)) {
         dev.installedApps = installedApps;
-        // Mescla novos apps sem perder status de bloqueio anterior
-        installedApps.forEach(newApp => {
-          const appId = newApp.id || newApp.package;
-          const existing = db.rules.blockedApps.find(a => a.id === appId);
-          if (appId && !existing) {
-            db.rules.blockedApps.push({
-              id: appId,
-              name: newApp.name,
-              category: newApp.category || 'Aplicativos',
-              isBlocked: false
-            });
-          }
+        // Reconcilia com a lista real enviada pelo aparelho: quem já existia mantém
+        // o isBlocked; quem não está mais instalado sai da lista (antes só juntava,
+        // nunca removia, então apps desinstalados ficavam pra sempre).
+        const previousById = new Map(db.rules.blockedApps.map(a => [a.id, a]));
+        db.rules.blockedApps = installedApps.map(app => {
+          const appId = app.id || app.package;
+          const existing = previousById.get(appId);
+          return {
+            id: appId,
+            name: app.name,
+            category: app.category || 'Aplicativos',
+            isBlocked: existing ? existing.isBlocked : false
+          };
         });
       }
       dev.lastSeen = new Date().toISOString();
@@ -477,6 +500,35 @@ io.on('connection', (socket) => {
       }));
     }
     syncTaskInstancesWithTemplate(db);
+    saveDatabase(db);
+    io.emit('state:update', getGlobalState());
+  });
+
+  // Pai cria uma nova cerca virtual ou edita uma existente (upsert por id; sem id = cria)
+  socket.on('parent:save_geofence', ({ id, name, latitude, longitude, radiusMeters }) => {
+    if (!name || latitude == null || longitude == null) return;
+    const existing = id && db.rules.geofences.find(g => g.id === id);
+    if (existing) {
+      existing.name = name;
+      existing.latitude = latitude;
+      existing.longitude = longitude;
+      existing.radiusMeters = Number(radiusMeters) || existing.radiusMeters;
+    } else {
+      db.rules.geofences.push({
+        id: 'gf-' + Date.now(),
+        name,
+        latitude,
+        longitude,
+        radiusMeters: Number(radiusMeters) || 150
+      });
+    }
+    saveDatabase(db);
+    io.emit('state:update', getGlobalState());
+  });
+
+  // Pai remove uma cerca virtual
+  socket.on('parent:remove_geofence', ({ id }) => {
+    db.rules.geofences = db.rules.geofences.filter(g => g.id !== id);
     saveDatabase(db);
     io.emit('state:update', getGlobalState());
   });
