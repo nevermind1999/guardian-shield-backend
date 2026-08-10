@@ -280,11 +280,18 @@ function getGlobalState() {
   };
 }
 
-// --- Tarefas diárias ---
+// --- Tarefas diárias + regras de bloqueio ---
 // O app da criança tem duas metades: a WebView/React (só socket.io) e a Home/serviço
 // nativos (LauncherHomeActivity/ParentalAccessibilityService), que ficam sempre vivos
 // mas não têm cliente socket.io. Por isso o lado nativo fala com o backend por HTTP
-// simples em vez de socket.io — os dois endpoints abaixo são pra ele.
+// simples em vez de socket.io — os endpoints abaixo são pra ele.
+//
+// Antes, pausa geral / apps bloqueados / limite diário só chegavam no aparelho via
+// socket.io quando a WebView estava aberta (a criança precisava entrar no app pra
+// qualquer mudança do pai surtir efeito, e o desbloqueio às vezes nunca chegava,
+// porque a WebView praticamente nunca fica aberta no uso normal — a criança usa a
+// Home/Gaveta nativas). Por isso /api/tasks/sync agora também devolve essas regras,
+// e o ParentalAccessibilityService as grava direto no SharedPreferences a cada poll.
 
 // Consultado a cada ~60s pelo ParentalAccessibilityService: resposta enxuta, só com
 // o que o nativo precisa pra atualizar a Home e decidir se bloqueia o aparelho.
@@ -294,8 +301,48 @@ app.get('/api/tasks/sync', (req, res) => {
     unlockMode: db.rules.taskUnlockMode,
     dailyLimitMinutes: computeEffectiveDailyLimitMinutes(db),
     dailyTasks: db.rules.dailyTasks,
-    todayStatus: db.taskInstances.items
+    todayStatus: db.taskInstances.items,
+    isPauseAllActive: db.rules.isPauseAllActive,
+    blockedPackages: db.rules.blockedApps.filter(a => a.isBlocked).map(a => a.id)
   });
+});
+
+/**
+ * Reconcilia a lista de apps instalados enviada pelo aparelho (fonte da verdade) com o
+ * que já existia: quem já estava na lista mantém o isBlocked; quem não está mais
+ * instalado sai (antes só juntava, nunca removia). Compartilhado entre o socket
+ * 'child:telemetry' (WebView) e POST /api/device/apps-sync (nativo, sempre vivo).
+ */
+function reconcileInstalledApps(dev, installedApps) {
+  dev.installedApps = installedApps;
+  const previousById = new Map(db.rules.blockedApps.map(a => [a.id, a]));
+  db.rules.blockedApps = installedApps.map(app => {
+    const appId = app.id || app.package;
+    const existing = previousById.get(appId);
+    return {
+      id: appId,
+      name: app.name,
+      category: app.category || 'Aplicativos',
+      isBlocked: existing ? existing.isBlocked : false
+    };
+  });
+}
+
+// Enviado a cada ~5min pelo ParentalAccessibilityService com a lista real de apps
+// instalados (mesma fonte que já alimenta a Home/Gaveta nativas) — antes essa lista só
+// chegava ao backend quando a WebView mandava telemetria, e a WebView raramente abre.
+app.post('/api/device/apps-sync', (req, res) => {
+  const { installedApps } = req.body || {};
+  const dev = Object.values(db.pairedDevices)[0];
+  if (!dev || !Array.isArray(installedApps)) {
+    return res.json({ success: false });
+  }
+  reconcileInstalledApps(dev, installedApps);
+  dev.lastSeen = new Date().toISOString();
+  dev.isOnline = true;
+  saveDatabase(db);
+  io.emit('state:update', getGlobalState());
+  res.json({ success: true });
 });
 
 // Chamado pela Home nativa depois de tirar a foto de comprovação de uma tarefa.
@@ -406,21 +453,7 @@ io.on('connection', (socket) => {
       if (usedMinutesToday !== undefined) dev.usedMinutesToday = usedMinutesToday;
       if (location) dev.location = location;
       if (Array.isArray(installedApps)) {
-        dev.installedApps = installedApps;
-        // Reconcilia com a lista real enviada pelo aparelho: quem já existia mantém
-        // o isBlocked; quem não está mais instalado sai da lista (antes só juntava,
-        // nunca removia, então apps desinstalados ficavam pra sempre).
-        const previousById = new Map(db.rules.blockedApps.map(a => [a.id, a]));
-        db.rules.blockedApps = installedApps.map(app => {
-          const appId = app.id || app.package;
-          const existing = previousById.get(appId);
-          return {
-            id: appId,
-            name: app.name,
-            category: app.category || 'Aplicativos',
-            isBlocked: existing ? existing.isBlocked : false
-          };
-        });
+        reconcileInstalledApps(dev, installedApps);
       }
       dev.lastSeen = new Date().toISOString();
       dev.isOnline = true;
