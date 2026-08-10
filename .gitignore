@@ -12,6 +12,9 @@ yarn-error.log*
 # Database state (runtime persistence)
 database.json
 
+# Fotos de comprovação de tarefas enviadas pela criança (conteúdo sensível, gerado em runtime)
+uploads/
+
 # OS files
 .DS_Store
 Thumbs.db
