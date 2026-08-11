@@ -96,7 +96,14 @@ function loadDatabase() {
       lastPinUnlockAt: null,
       // Setado por parent:request_location_update, consumido e zerado assim que o
       // nativo reporta uma localização fresca em POST /api/device/location-sync.
-      locationUpdateRequested: false
+      locationUpdateRequested: false,
+      // Mesmo padrão, pro botão de sincronizar do header do app do Pai: pede que o
+      // nativo reenvie bateria/wifi/modelo no próximo poll (~1min), em vez de esperar
+      // o ciclo periódico de ~5min — ver postDeviceTelemetry no nativo.
+      deviceSyncRequested: false,
+      // Telefone que o botão "Chamada de Emergência" da tela de bloqueio (app do
+      // Filho) disca via tel: — null até o pai cadastrar um (ver parent:set_emergency_phone).
+      emergencyPhone: null
     },
     // Status do dia corrente de cada tarefa do template acima — regenerado
     // automaticamente quando a data muda (ver ensureTasksForToday).
@@ -123,6 +130,8 @@ if (!db.taskInstances) db.taskInstances = { date: null, items: [] };
 if (db.rules.unlockPinHash === undefined) db.rules.unlockPinHash = null;
 if (db.rules.lastPinUnlockAt === undefined) db.rules.lastPinUnlockAt = null;
 if (db.rules.locationUpdateRequested === undefined) db.rules.locationUpdateRequested = false;
+if (db.rules.deviceSyncRequested === undefined) db.rules.deviceSyncRequested = false;
+if (db.rules.emergencyPhone === undefined) db.rules.emergencyPhone = null;
 
 function blankTaskItem(taskId) {
   return { taskId, status: 'pending', photoUrl: null, submittedAt: null, approvedAt: null, rejectedReason: null };
@@ -269,7 +278,10 @@ function getGlobalState() {
       // O hash em si nunca é exposto pro app do pai, só se existe um cadastrado —
       // o pai não precisa (nem deve) conseguir ler o PIN de volta.
       hasUnlockPin: Boolean(db.rules.unlockPinHash),
-      lastPinUnlockAt: db.rules.lastPinUnlockAt
+      lastPinUnlockAt: db.rules.lastPinUnlockAt,
+      // Vai pro app do Filho como está (não é sensível como o PIN) — usado pelo
+      // botão "Chamada de Emergência" da tela de bloqueio (tel: link).
+      emergencyPhone: db.rules.emergencyPhone
     },
     blockedApps: db.rules.blockedApps.length > 0 ? db.rules.blockedApps : (primaryChild.installedApps || []),
     contentFilter: db.rules.contentFilter,
@@ -323,7 +335,8 @@ app.get('/api/tasks/sync', (req, res) => {
     // Hash SHA-256 do PIN de emergência (nunca o valor em texto puro) — o nativo
     // guarda isso localmente e faz a checagem 100% offline (ver LockOverlayService).
     unlockPinHash: db.rules.unlockPinHash,
-    locationUpdateRequested: db.rules.locationUpdateRequested
+    locationUpdateRequested: db.rules.locationUpdateRequested,
+    deviceSyncRequested: db.rules.deviceSyncRequested
   });
 });
 
@@ -338,6 +351,27 @@ app.post('/api/device/location-sync', (req, res) => {
   }
   dev.location = { latitude, longitude, accuracy, lastUpdated: new Date().toISOString() };
   db.rules.locationUpdateRequested = false;
+  dev.lastSeen = new Date().toISOString();
+  dev.isOnline = true;
+  saveDatabase(db);
+  io.emit('state:update', getGlobalState());
+  res.json({ success: true });
+});
+
+// Chamado pelo nativo com bateria/rede/modelo atuais — a cada ~5min sozinho, ou na
+// hora seguinte a um pedido do botão de sincronizar do app do Pai (ver
+// deviceSyncRequested acima). Antes esses 3 campos só chegavam via 'child:telemetry'
+// (WebView), que quase nunca abre no uso normal — ficavam desatualizados por dias.
+app.post('/api/device/telemetry-sync', (req, res) => {
+  const { batteryLevel, networkType, deviceModel } = req.body || {};
+  const dev = Object.values(db.pairedDevices)[0];
+  if (!dev) {
+    return res.json({ success: false });
+  }
+  if (batteryLevel !== undefined) dev.batteryLevel = batteryLevel;
+  if (networkType) dev.networkType = networkType;
+  if (deviceModel) dev.model = deviceModel;
+  db.rules.deviceSyncRequested = false;
   dev.lastSeen = new Date().toISOString();
   dev.isOnline = true;
   saveDatabase(db);
@@ -536,10 +570,42 @@ io.on('connection', (socket) => {
     io.emit('state:update', getGlobalState());
   });
 
+  // Telefone que o botão "Chamada de Emergência" (tela de bloqueio do Filho) disca
+  // via tel: — ao contrário do PIN, não é sensível, então guarda em texto puro mesmo.
+  socket.on('parent:set_emergency_phone', (phone) => {
+    const cleaned = String(phone || '').trim();
+    db.rules.emergencyPhone = cleaned || null;
+    saveDatabase(db);
+    io.emit('state:update', getGlobalState());
+  });
+
+  // Horário de Dormir/Estudo: só persiste (mostrado no app do Filho) — ainda não
+  // bloqueia o aparelho nesses horários, por decisão explícita (fica pra uma
+  // rodada futura, mexer em enforcement é risco maior que reestilizar).
+  socket.on('parent:set_schedule', ({ key, enabled, start, end }) => {
+    if (key !== 'bedtimeSchedule' && key !== 'studySchedule') return;
+    const current = db.rules[key] || {};
+    db.rules[key] = {
+      enabled: typeof enabled === 'boolean' ? enabled : current.enabled,
+      start: start || current.start,
+      end: end || current.end
+    };
+    saveDatabase(db);
+    io.emit('state:update', getGlobalState());
+  });
+
   // Pede que o aparelho busque uma localização fresca (GPS ativo) no próximo poll,
   // em vez de só reenviar a última posição em cache — ver locationUpdateRequested.
   socket.on('parent:request_location_update', () => {
     db.rules.locationUpdateRequested = true;
+    saveDatabase(db);
+    io.emit('state:update', getGlobalState());
+  });
+
+  // Botão de sincronizar do header do app do Pai: pede que o nativo reenvie
+  // bateria/wifi/modelo no próximo poll (~1min) — ver deviceSyncRequested.
+  socket.on('parent:request_device_sync', () => {
+    db.rules.deviceSyncRequested = true;
     saveDatabase(db);
     io.emit('state:update', getGlobalState());
   });
