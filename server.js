@@ -101,6 +101,10 @@ function loadDatabase() {
       // nativo reenvie bateria/wifi/modelo no próximo poll (~1min), em vez de esperar
       // o ciclo periódico de ~5min — ver postDeviceTelemetry no nativo.
       deviceSyncRequested: false,
+      // Setado por parent:reset_daily_usage (botão "Zerar tempo usado hoje" — pro pai
+      // corrigir depois de usar o tempo da criança testando o app, por exemplo).
+      // Consumido e zerado assim que o nativo confirma via POST /api/device/reset-usage-ack.
+      resetUsageRequested: false,
       // Telefone que o botão "Chamada de Emergência" da tela de bloqueio (app do
       // Filho) disca via tel: — null até o pai cadastrar um (ver parent:set_emergency_phone).
       emergencyPhone: null
@@ -131,6 +135,7 @@ if (db.rules.unlockPinHash === undefined) db.rules.unlockPinHash = null;
 if (db.rules.lastPinUnlockAt === undefined) db.rules.lastPinUnlockAt = null;
 if (db.rules.locationUpdateRequested === undefined) db.rules.locationUpdateRequested = false;
 if (db.rules.deviceSyncRequested === undefined) db.rules.deviceSyncRequested = false;
+if (db.rules.resetUsageRequested === undefined) db.rules.resetUsageRequested = false;
 if (db.rules.emergencyPhone === undefined) db.rules.emergencyPhone = null;
 
 function blankTaskItem(taskId) {
@@ -386,11 +391,22 @@ app.get('/api/tasks/sync', (req, res) => {
     unlockPinHash: db.rules.unlockPinHash,
     locationUpdateRequested: db.rules.locationUpdateRequested,
     deviceSyncRequested: db.rules.deviceSyncRequested,
+    resetUsageRequested: db.rules.resetUsageRequested,
     // Telefone do botão "Chamada de Emergência" — faltava aqui (só ia pro app do Pai via
     // socket.io); sem isso o nativo nunca sincronizava e o botão não tinha como existir
     // de verdade na tela de bloqueio nem na Home (ver LockOverlayService/LauncherHomeActivity).
     emergencyPhone: db.rules.emergencyPhone
   });
+});
+
+// Chamado pelo nativo assim que zera o contador local de tempo usado hoje, em resposta
+// a resetUsageRequested (ver parent:reset_daily_usage) — confirma pro backend que já foi
+// feito de verdade, pra parar de mandar o pedido nos próximos polls.
+app.post('/api/device/reset-usage-ack', (req, res) => {
+  db.rules.resetUsageRequested = false;
+  saveDatabase(db);
+  io.emit('state:update', getGlobalState());
+  res.json({ success: true });
 });
 
 // Chamado pelo nativo assim que consegue uma localização fresca (a cada tick normal,
@@ -663,6 +679,18 @@ io.on('connection', (socket) => {
   // bateria/wifi/modelo no próximo poll (~1min) — ver deviceSyncRequested.
   socket.on('parent:request_device_sync', () => {
     db.rules.deviceSyncRequested = true;
+    saveDatabase(db);
+    io.emit('state:update', getGlobalState());
+  });
+
+  // "Zerar tempo usado hoje" — pro pai corrigir depois de usar o tempo da criança
+  // testando o app, por exemplo. Zera o valor exibido no painel na hora (dev.usedMinutesToday)
+  // e pede que o nativo zere o contador LOCAL de verdade (GuardianPrefs, é quem decide o
+  // bloqueio por tempo esgotado) no próximo poll — ver resetUsageRequested/reset-usage-ack.
+  socket.on('parent:reset_daily_usage', () => {
+    db.rules.resetUsageRequested = true;
+    const dev = Object.values(db.pairedDevices)[0];
+    if (dev) dev.usedMinutesToday = 0;
     saveDatabase(db);
     io.emit('state:update', getGlobalState());
   });
