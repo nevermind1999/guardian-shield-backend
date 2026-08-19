@@ -253,6 +253,42 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+/**
+ * true se o horário ATUAL (relógio do servidor, não do celular da criança — evita que
+ * mudar a hora do aparelho furasse o bloqueio) cai dentro de um agendamento habilitado.
+ * Suporta intervalo que cruza a meia-noite (ex: 22:00 -> 07:00): nesse caso start > end,
+ * então em vez de "start <= agora < end" a checagem vira "agora >= start OU agora < end".
+ */
+function isWithinSchedule(schedule) {
+  if (!schedule || !schedule.enabled) return false;
+  const [startH, startM] = schedule.start.split(':').map(Number);
+  const [endH, endM] = schedule.end.split(':').map(Number);
+  const startMinutes = startH * 60 + startM;
+  const endMinutes = endH * 60 + endM;
+  if (startMinutes === endMinutes) return false; // intervalo de 0min, nunca bloqueia
+  const now = new Date();
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  return startMinutes < endMinutes
+    ? (nowMinutes >= startMinutes && nowMinutes < endMinutes)
+    : (nowMinutes >= startMinutes || nowMinutes < endMinutes);
+}
+
+/**
+ * Horário de Dormir ganha prioridade sobre Horário de Estudo se os dois coincidirem
+ * (configuração incomum, mas evita ambiguidade) — devolve null se nenhum estiver ativo
+ * agora. Usado tanto pra decidir o bloqueio de verdade (isScheduledBlockActive em
+ * /api/tasks/sync) quanto pra saber a mensagem certa (rótulo + horário de término).
+ */
+function activeScheduleBlock() {
+  if (isWithinSchedule(db.rules.bedtimeSchedule)) {
+    return { label: '🌙 Horário de Dormir', endsAt: db.rules.bedtimeSchedule.end };
+  }
+  if (isWithinSchedule(db.rules.studySchedule)) {
+    return { label: '📚 Horário de Estudo', endsAt: db.rules.studySchedule.end };
+  }
+  return null;
+}
+
 function getGlobalState() {
   ensureTasksForToday(db);
   const devicesList = Object.values(db.pairedDevices);
@@ -325,6 +361,7 @@ function getGlobalState() {
 // o que o nativo precisa pra atualizar a Home e decidir se bloqueia o aparelho.
 app.get('/api/tasks/sync', (req, res) => {
   ensureTasksForToday(db);
+  const scheduleBlock = activeScheduleBlock();
   res.json({
     unlockMode: db.rules.taskUnlockMode,
     dailyLimitMinutes: computeEffectiveDailyLimitMinutes(db),
@@ -332,11 +369,27 @@ app.get('/api/tasks/sync', (req, res) => {
     todayStatus: db.taskInstances.items,
     isPauseAllActive: db.rules.isPauseAllActive,
     blockedPackages: db.rules.blockedApps.filter(a => a.isBlocked).map(a => a.id),
+    // Apps que o pai marcou como "sempre disponível" — o nativo libera esses pacotes
+    // mesmo com Pausa Geral, tarefas pendentes, tempo esgotado ou bloqueio individual
+    // ativos (ver reevaluateBlockState em ParentalAccessibilityService.kt).
+    alwaysAvailablePackages: db.rules.blockedApps.filter(a => a.isAlwaysAvailable).map(a => a.id),
+    // Horário de Dormir/Estudo: bloqueio de verdade agora (calculado com o relógio do
+    // servidor — ver activeScheduleBlock), + os horários brutos pro nativo saber mostrar
+    // "próximo bloqueio agendado" na Home mesmo quando nada está bloqueando ainda.
+    scheduledBlockActive: scheduleBlock !== null,
+    scheduledBlockLabel: scheduleBlock ? scheduleBlock.label : null,
+    scheduledBlockEndsAt: scheduleBlock ? scheduleBlock.endsAt : null,
+    bedtimeSchedule: db.rules.bedtimeSchedule,
+    studySchedule: db.rules.studySchedule,
     // Hash SHA-256 do PIN de emergência (nunca o valor em texto puro) — o nativo
     // guarda isso localmente e faz a checagem 100% offline (ver LockOverlayService).
     unlockPinHash: db.rules.unlockPinHash,
     locationUpdateRequested: db.rules.locationUpdateRequested,
-    deviceSyncRequested: db.rules.deviceSyncRequested
+    deviceSyncRequested: db.rules.deviceSyncRequested,
+    // Telefone do botão "Chamada de Emergência" — faltava aqui (só ia pro app do Pai via
+    // socket.io); sem isso o nativo nunca sincronizava e o botão não tinha como existir
+    // de verdade na tela de bloqueio nem na Home (ver LockOverlayService/LauncherHomeActivity).
+    emergencyPhone: db.rules.emergencyPhone
   });
 });
 
@@ -407,7 +460,11 @@ function reconcileInstalledApps(dev, installedApps) {
       id: appId,
       name: app.name,
       category: app.category || 'Aplicativos',
-      isBlocked: existing ? existing.isBlocked : false
+      isBlocked: existing ? existing.isBlocked : false,
+      // "Sempre disponível": ignora Pausa Geral, tarefas pendentes, tempo esgotado E
+      // o próprio isBlocked acima — ver alwaysAvailablePackages em /api/tasks/sync
+      // e o early-return em reevaluateBlockState no nativo.
+      isAlwaysAvailable: existing ? existing.isAlwaysAvailable || false : false
     };
   });
 }
@@ -614,6 +671,20 @@ io.on('connection', (socket) => {
     const app = db.rules.blockedApps.find(a => a.id === appId);
     if (app) {
       app.isBlocked = isBlocked;
+      saveDatabase(db);
+      io.emit('state:update', getGlobalState());
+    }
+  });
+
+  // "Sempre disponível": app fica liberado independente de Pausa Geral, tarefas
+  // pendentes, tempo esgotado ou bloqueio individual (ver alwaysAvailablePackages
+  // em /api/tasks/sync). Independente do isBlocked de propósito — o pai pode deixar
+  // marcado como bloqueado E sempre-disponível ao mesmo tempo sem conflito, porque
+  // é o always-available que vence no nativo (checado antes de tudo o mais).
+  socket.on('parent:toggle_app_always_available', ({ appId, isAlwaysAvailable }) => {
+    const app = db.rules.blockedApps.find(a => a.id === appId);
+    if (app) {
+      app.isAlwaysAvailable = isAlwaysAvailable;
       saveDatabase(db);
       io.emit('state:update', getGlobalState());
     }
