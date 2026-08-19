@@ -432,7 +432,7 @@ app.post('/api/device/location-sync', (req, res) => {
 // deviceSyncRequested acima). Antes esses 3 campos só chegavam via 'child:telemetry'
 // (WebView), que quase nunca abre no uso normal — ficavam desatualizados por dias.
 app.post('/api/device/telemetry-sync', (req, res) => {
-  const { batteryLevel, networkType, deviceModel } = req.body || {};
+  const { batteryLevel, networkType, deviceModel, usedMinutesToday } = req.body || {};
   const dev = Object.values(db.pairedDevices)[0];
   if (!dev) {
     return res.json({ success: false });
@@ -440,6 +440,13 @@ app.post('/api/device/telemetry-sync', (req, res) => {
   if (batteryLevel !== undefined) dev.batteryLevel = batteryLevel;
   if (networkType) dev.networkType = networkType;
   if (deviceModel) dev.model = deviceModel;
+  // O serviço de acessibilidade (sempre vivo) é quem conta o tempo de tela de verdade —
+  // antes só a WebView de Configurações mandava isso via 'child:telemetry', e ela quase
+  // nunca abre no uso normal, deixando o painel do pai com um número desatualizado o dia
+  // inteiro (só corrigia se o dia virasse e o contador local zerasse sozinho).
+  if (typeof usedMinutesToday === 'number' && usedMinutesToday >= 0) {
+    dev.usedMinutesToday = usedMinutesToday;
+  }
   db.rules.deviceSyncRequested = false;
   dev.lastSeen = new Date().toISOString();
   dev.isOnline = true;
