@@ -27,6 +27,14 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+// App do Pai acessível direto pelo navegador (sem instalar nada) — build web do mesmo
+// React do app Android (parent-app/dist, copiado aqui em cada deploy — mesmo padrão dos
+// APKs em apks/, o VPS só dá git pull, não builda nada sozinho). Funciona de verdade
+// porque a build já lê VITE_BACKEND_URL como este próprio domínio e já é 100% compatível
+// com navegador (as poucas partes nativas — download de APK, StatusBar — são só
+// puladas via Capacitor.isNativePlatform() quando não é o app instalado).
+app.use(express.static(path.join(__dirname, 'public')));
+
 app.get(['/api/download/filho', '/apks/GuardianShield-Filho.apk'], (req, res) => {
   const localFile = path.join(APKS_DIR, 'GuardianShield-Filho.apk');
   if (fs.existsSync(localFile)) {
