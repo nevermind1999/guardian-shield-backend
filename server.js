@@ -7,6 +7,9 @@ const path = require('path');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { initFirebase, sendPushToFamily } = require('./push');
+
+initFirebase();
 
 const app = express();
 app.use(cors());
@@ -151,7 +154,15 @@ function familyDefaults() {
       resetUsageRequested: false,
       // Telefone que o botão "Chamada de Emergência" da tela de bloqueio (app do
       // Filho) disca via tel: — null até o pai cadastrar um (ver parent:set_emergency_phone).
-      emergencyPhone: null
+      emergencyPhone: null,
+      // Tokens FCM dos apps do Pai instalados que já registraram (ver
+      // parent:register_push_token) — cada um recebe o push quando chega pedido de
+      // tempo extra ou tarefa enviada aguardando aprovação (ver push.js). Lista (não um
+      // valor só) porque é normal um mesmo pai ter o token de mais de uma instalação —
+      // reinstalou o app, trocou de aparelho, etc. Tokens inválidos/expirados são
+      // removidos sozinhos quando o Firebase reporta erro nesse token (ver
+      // sendPushToFamily).
+      pushTokens: []
     },
     // Status do dia corrente de cada tarefa do template acima — regenerado
     // automaticamente quando a data muda (ver ensureTasksForToday).
@@ -222,6 +233,7 @@ function backfillFamilyDefaults(family) {
   if (family.rules.deviceSyncRequested === undefined) family.rules.deviceSyncRequested = false;
   if (family.rules.resetUsageRequested === undefined) family.rules.resetUsageRequested = false;
   if (family.rules.emergencyPhone === undefined) family.rules.emergencyPhone = null;
+  if (!Array.isArray(family.rules.pushTokens)) family.rules.pushTokens = [];
   if (!family.timeRequests) family.timeRequests = [];
 }
 Object.values(db.families).forEach(backfillFamilyDefaults);
@@ -724,6 +736,14 @@ app.post('/api/tasks/:taskId/submit', (req, res) => {
 
     io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
     io.to(familyRoom(familyId)).emit('notification:new_task_submission', item);
+
+    const taskTitle = family.rules.dailyTasks.find(t => t.id === taskId)?.title || 'Tarefa';
+    sendPushToFamily(family, {
+      title: '📸 Tarefa enviada',
+      body: `${taskTitle} — aguardando sua aprovação.`,
+      data: { type: 'task_submitted', taskId }
+    });
+
     res.json({ success: true, item });
   } catch (e) {
     console.error('Erro ao salvar foto de tarefa:', e);
@@ -961,6 +981,24 @@ io.on('connection', (socket) => {
     saveDatabase(db);
     io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
     io.to(familyRoom(familyId)).emit('notification:new_time_request', newRequest);
+
+    sendPushToFamily(family, {
+      title: '⏱️ Pedido de tempo extra',
+      body: `+${newRequest.requestedMinutes} min — "${newRequest.reason}"`,
+      data: { type: 'time_request', requestId: newRequest.id }
+    });
+  });
+
+  // App do Pai registra (ou reafirma) o token FCM deste aparelho — chamado toda vez que
+  // o socket conecta com um token disponível, não só na primeira vez (o token pode
+  // mudar, e reenviar o mesmo não faz mal, só não duplica na lista abaixo).
+  socket.on('parent:register_push_token', ({ token } = {}) => {
+    if (!token) return;
+    if (!Array.isArray(family.rules.pushTokens)) family.rules.pushTokens = [];
+    if (!family.rules.pushTokens.includes(token)) {
+      family.rules.pushTokens.push(token);
+      saveDatabase(db);
+    }
   });
 
   // Pai edita a lista de tarefas do dia e/ou o modo de bloqueio ('off' | 'earn' | 'all_or_nothing')
