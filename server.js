@@ -13,7 +13,7 @@ const path = require('path');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { initFirebase, sendPushToFamily, isPushInitialized } = require('./push');
+const { initFirebase, sendPushToFamily } = require('./push');
 
 initFirebase();
 
@@ -35,20 +35,6 @@ if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-// DEBUG TEMPORÁRIO — diagnosticando por que o push ainda não está saindo (sem acesso SSH
-// à VPS pra olhar log). Não expõe nada sensível (só booleano + contagem). Remover depois
-// que o push estiver confirmado funcionando.
-app.get('/api/debug/push-status', (req, res) => {
-  const family = db.families?.[LEGACY_FAMILY_ID];
-  res.json({
-    firebaseInitialized: isPushInitialized(),
-    hasEnvVar: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT),
-    envVarLength: (process.env.FIREBASE_SERVICE_ACCOUNT || '').length,
-    legacyFamilyExists: Boolean(family),
-    pushTokenCount: family?.rules?.pushTokens?.length || 0
-  });
-});
 
 // App do Pai acessível direto pelo navegador (sem instalar nada) — build web do mesmo
 // React do app Android (parent-app/dist, copiado aqui em cada deploy — mesmo padrão dos
