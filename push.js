@@ -50,8 +50,17 @@ async function sendPushToFamily(family, { title, body, data } = {}) {
   try {
     const response = await getMessaging().sendEachForMulticast({
       tokens,
-      notification: { title, body },
-      data: data ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) : undefined,
+      // Só "data", sem "notification": com "notification" no payload, o Android
+      // intercepta e desenha a notificação SOZINHO com o canal/ícone padrão do FCM
+      // sempre que o app está em segundo plano — nunca chega a chamar
+      // PushNotificationService.onMessageReceived(), que é onde o ícone/canal/cor
+      // certos são montados. "Data-only" força passar pelo nosso código sempre,
+      // fechado ou aberto (era a causa real do ícone quadrado, não o mipmap).
+      data: {
+        title,
+        body,
+        ...(data ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) : {})
+      },
       android: { priority: 'high' }
     });
 
