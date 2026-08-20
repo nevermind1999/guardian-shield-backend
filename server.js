@@ -786,10 +786,14 @@ io.on('connection', (socket) => {
 
   // Recebe dados REAIS de telemetria enviados pelo dispositivo do Filho
   socket.on('child:telemetry', (data) => {
-    const { deviceId, deviceName, deviceModel, batteryLevel, usedMinutesToday, location, installedApps } = data || {};
+    const { deviceId, deviceModel, batteryLevel, usedMinutesToday, location, installedApps } = data || {};
     if (deviceId && family.pairedDevices[deviceId]) {
       const dev = family.pairedDevices[deviceId];
-      if (deviceName) dev.name = deviceName;
+      // `name` NÃO é atualizado por telemetria (nem daqui nem de /api/device/telemetry-sync)
+      // — só é gravado 1x no pareamento (completePairing) e depois só o pai pode trocar
+      // (parent:rename_device). Sem essa exceção, o próprio celular reafirmando o nome
+      // detectado automaticamente (deviceName) a cada telemetria apagaria silenciosamente
+      // qualquer nome que o pai tivesse escolhido.
       if (deviceModel) dev.model = deviceModel;
       if (batteryLevel !== undefined) dev.batteryLevel = batteryLevel;
       if (usedMinutesToday !== undefined) dev.usedMinutesToday = usedMinutesToday;
@@ -864,6 +868,21 @@ io.on('connection', (socket) => {
     family.rules.deviceSyncRequested = true;
     saveDatabase(db);
     io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  });
+
+  // Renomear o celular do filho (ex: "Moto G60 (Filho)" -> "Celular do João"). Só o pai
+  // grava esse nome — diferente de model/bateria/rede, que o próprio aparelho reenvia
+  // sozinho a cada telemetria (ver child:telemetry e /api/device/telemetry-sync), o campo
+  // `name` NUNCA é sobrescrito por telemetria automática (só na criação do pareamento),
+  // então o nome escolhido aqui fica valendo até o pai trocar de novo.
+  socket.on('parent:rename_device', ({ deviceId, name } = {}) => {
+    const dev = family.pairedDevices[deviceId];
+    const trimmed = (name || '').trim();
+    if (dev && trimmed) {
+      dev.name = trimmed.slice(0, 40);
+      saveDatabase(db);
+      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    }
   });
 
   // "Zerar tempo usado hoje" — pro pai corrigir depois de usar o tempo da criança
