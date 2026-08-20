@@ -9,6 +9,7 @@
  * configurado no .env — mesmo padrão de "aviso e segue sem" que JWT_SECRET já usa aqui.
  */
 const admin = require('firebase-admin');
+const { getMessaging } = require('firebase-admin/messaging');
 
 let initialized = false;
 
@@ -21,7 +22,11 @@ function initFirebase() {
   }
   try {
     const serviceAccount = JSON.parse(raw);
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    // firebase-admin v14 mudou a API — não é mais admin.credential.cert(...), agora
+    // "cert" fica direto em admin (confirmado testando localmente contra a versão
+    // instalada; admin.credential era undefined, por isso initFirebase() falhava
+    // silenciosamente até agora).
+    admin.initializeApp({ credential: admin.cert(serviceAccount) });
     initialized = true;
     console.log('🔔 Firebase Admin inicializado — notificações push ativas.');
   } catch (e) {
@@ -43,7 +48,7 @@ async function sendPushToFamily(family, { title, body, data } = {}) {
   if (tokens.length === 0) return;
 
   try {
-    const response = await admin.messaging().sendEachForMulticast({
+    const response = await getMessaging().sendEachForMulticast({
       tokens,
       notification: { title, body },
       data: data ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) : undefined,
