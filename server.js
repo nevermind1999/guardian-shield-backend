@@ -623,10 +623,37 @@ app.post('/api/device/location-sync', (req, res) => {
   family.rules.locationUpdateRequested = false;
   dev.lastSeen = new Date().toISOString();
   dev.isOnline = true;
+  checkGeofenceCrossings(family, dev.location);
   saveDatabase(db);
   io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   res.json({ success: true });
 });
+
+/**
+ * Compara a posição nova contra cada cerca virtual e dispara um push só nas TRANSIÇÕES
+ * (entrou agora / saiu agora), nunca a cada atualização de GPS — por isso guarda
+ * lastKnownStatus em cada cerca (persistido) e só notifica quando ele muda de valor.
+ * Ignora a primeiríssima leitura de cada cerca (lastKnownStatus ainda undefined): sem
+ * isso, toda cerca cadastrada disparava um push "entrou/saiu" assim que o pai a criava,
+ * mesmo sem a criança ter se movido de verdade.
+ */
+function checkGeofenceCrossings(family, location) {
+  family.rules.geofences.forEach(gf => {
+    const distance = haversineMeters(location.latitude, location.longitude, gf.latitude, gf.longitude);
+    const newStatus = distance <= gf.radiusMeters ? 'inside' : 'outside';
+    const previousStatus = gf.lastKnownStatus;
+    gf.lastKnownStatus = newStatus;
+    if (previousStatus === undefined || previousStatus === newStatus) return;
+
+    sendPushToFamily(family, {
+      title: newStatus === 'inside' ? `📍 Chegou em ${gf.name}` : `🚧 Saiu de ${gf.name}`,
+      body: newStatus === 'inside'
+        ? `Seu filho entrou na área "${gf.name}" agora.`
+        : `Seu filho saiu da área "${gf.name}" agora.`,
+      data: { type: 'geofence', geofenceId: gf.id, status: newStatus }
+    });
+  });
+}
 
 // Chamado pelo nativo com bateria/rede/modelo atuais — a cada ~5min sozinho, ou na
 // hora seguinte a um pedido do botão de sincronizar do app do Pai (ver
@@ -667,6 +694,16 @@ app.post('/api/device/pin-unlock-ack', (req, res) => {
   family.rules.lastPinUnlockAt = new Date().toISOString();
   saveDatabase(db);
   io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+
+  // "Break glass": a criança destravou o aparelho sozinha com o PIN de emergência —
+  // o pai precisa saber na hora, é exatamente o tipo de evento que essa opção existe
+  // pra permitir sem burlar o controle silenciosamente.
+  sendPushToFamily(family, {
+    title: '🔓 PIN de emergência usado',
+    body: 'Seu filho destravou o aparelho agora usando o PIN de emergência.',
+    data: { type: 'pin_unlock' }
+  });
+
   res.json({ success: true });
 });
 
@@ -679,6 +716,17 @@ app.post('/api/device/pin-unlock-ack', (req, res) => {
 function reconcileInstalledApps(family, dev, installedApps) {
   dev.installedApps = installedApps;
   const previousById = new Map(family.rules.blockedApps.map(a => [a.id, a]));
+  // Alerta de "app novo instalado" — só se já existia uma lista antes (senão o
+  // primeiríssimo sync depois de parear dispararia um push pra CADA app já instalado
+  // no aparelho, dezenas de notificações de uma vez). Junta os nomes num push só,
+  // mesmo se vários apps novos apareceram entre um sync e outro.
+  const isFirstSyncEver = previousById.size === 0;
+  const newlyInstalledNames = !isFirstSyncEver
+    ? installedApps
+        .filter(app => !previousById.has(app.id || app.package))
+        .map(app => app.name)
+    : [];
+
   family.rules.blockedApps = installedApps.map(app => {
     const appId = app.id || app.package;
     const existing = previousById.get(appId);
@@ -693,6 +741,20 @@ function reconcileInstalledApps(family, dev, installedApps) {
       isAlwaysAvailable: existing ? existing.isAlwaysAvailable || false : false
     };
   });
+
+  if (newlyInstalledNames.length === 1) {
+    sendPushToFamily(family, {
+      title: '📲 Novo app instalado',
+      body: `Seu filho instalou "${newlyInstalledNames[0]}".`,
+      data: { type: 'new_app' }
+    });
+  } else if (newlyInstalledNames.length > 1) {
+    sendPushToFamily(family, {
+      title: '📲 Novos apps instalados',
+      body: `Seu filho instalou: ${newlyInstalledNames.join(', ')}.`,
+      data: { type: 'new_app' }
+    });
+  }
 }
 
 // Enviado a cada ~5min pelo ParentalAccessibilityService com a lista real de apps
@@ -730,6 +792,7 @@ app.post('/api/tasks/:taskId/submit', (req, res) => {
   }
 
   try {
+    const wasRejected = item.status === 'rejected';
     const rawBase64 = photoBase64.includes(',') ? photoBase64.split(',').pop() : photoBase64;
     const fileName = `${taskId}-${Date.now()}.jpg`;
     fs.writeFileSync(path.join(UPLOADS_DIR, fileName), Buffer.from(rawBase64, 'base64'));
@@ -745,8 +808,10 @@ app.post('/api/tasks/:taskId/submit', (req, res) => {
 
     const taskTitle = family.rules.dailyTasks.find(t => t.id === taskId)?.title || 'Tarefa';
     sendPushToFamily(family, {
-      title: '📸 Tarefa enviada',
-      body: `${taskTitle} — aguardando sua aprovação.`,
+      title: wasRejected ? '📸 Tarefa reenviada' : '📸 Tarefa enviada',
+      body: wasRejected
+        ? `${taskTitle} — sua criança tentou de novo depois da recusa. Aguardando sua aprovação.`
+        : `${taskTitle} — aguardando sua aprovação.`,
       data: { type: 'task_submitted', taskId }
     });
 
@@ -1088,6 +1153,46 @@ io.on('connection', (socket) => {
     }
   });
 });
+
+/**
+ * "Deixou de fazer": às 20h (horário do servidor), avisa 1x por dia se ainda sobrar
+ * tarefa não aprovada — dá tempo real da criança terminar antes do aviso (não dispara de
+ * manhã cedo já reclamando), mas ainda sobra a noite pra resolver. Roda a cada 15min só
+ * checando a hora atual (mais simples que agendar um timer exato por família); o dedupe
+ * por família (tasksReminderSentDate) garante 1 aviso por dia mesmo rodando várias vezes
+ * dentro da janela das 20h-20h15.
+ */
+const DAILY_TASKS_REMINDER_HOUR = 20;
+
+function checkPendingTasksReminders() {
+  const now = new Date();
+  if (now.getHours() !== DAILY_TASKS_REMINDER_HOUR) return;
+  const today = now.toISOString().slice(0, 10);
+
+  Object.values(db.families).forEach(family => {
+    if (family.rules.tasksReminderSentDate === today) return;
+    if (!Array.isArray(family.rules.dailyTasks) || family.rules.dailyTasks.length === 0) return;
+    ensureTasksForToday(family);
+
+    const pending = family.taskInstances.items.filter(item => item.status !== 'approved');
+    if (pending.length === 0) return;
+
+    family.rules.tasksReminderSentDate = today;
+    saveDatabase(db);
+
+    const titleById = new Map(family.rules.dailyTasks.map(t => [t.id, t.title]));
+    const pendingTitles = pending.map(item => titleById.get(item.taskId) || 'Tarefa');
+    sendPushToFamily(family, {
+      title: '⏰ Tarefas do dia ainda pendentes',
+      body: pending.length === 1
+        ? `"${pendingTitles[0]}" ainda não foi concluída hoje.`
+        : `${pending.length} tarefas ainda não foram concluídas hoje: ${pendingTitles.join(', ')}.`,
+      data: { type: 'tasks_pending_reminder' }
+    });
+  });
+}
+
+setInterval(checkPendingTasksReminders, 15 * 60 * 1000);
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
