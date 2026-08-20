@@ -5,6 +5,8 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(cors());
@@ -54,20 +56,57 @@ app.get('/api/apks/latest', (req, res) => {
   });
 });
 
+// ============================== AUTENTICAÇÃO (multi-tenant) ==============================
+// Cada conta (email+senha por enquanto; ver /api/auth/*) é dona de UMA família — o mesmo
+// conjunto de dados que antes vivia solto na raiz do banco (pairedDevices/rules/etc).
+// O app do Filho NUNCA loga: ele recebe um "deviceToken" (token de dispositivo, não de
+// usuário) no momento do pareamento, e usa isso pra toda chamada HTTP dali em diante —
+// ver signDeviceToken/resolveDeviceFamily. O JWT_SECRET default só existe pra não travar
+// em desenvolvimento local; em produção (VPS) precisa vir de variável de ambiente de verdade.
+const JWT_SECRET = process.env.JWT_SECRET || 'guardianshield-dev-secret-trocar-em-producao';
+if (!process.env.JWT_SECRET) {
+  console.warn('⚠️  JWT_SECRET não definido no ambiente — usando um valor de desenvolvimento. Defina JWT_SECRET na VPS antes de ir pra produção de verdade.');
+}
+const JWT_USER_EXPIRES_IN = '60d';
+
+// Família "de antes do login existir" — ver migrateToMultiTenant. Só passa a existir de
+// verdade se o database.json carregado já tinha dados no formato antigo (pairedDevices
+// solto na raiz); um deploy 100% novo nunca cria essa família.
+const LEGACY_FAMILY_ID = 'legacy';
+
+function signUserToken(user) {
+  return jwt.sign({ userId: user.id, familyId: user.familyId }, JWT_SECRET, { expiresIn: JWT_USER_EXPIRES_IN });
+}
+
+/** Sem expiração de propósito — a recuperação em caso de token perdido/corrompido é
+ * simplesmente reparear o aparelho, igual já era o comportamento antes de login existir. */
+function signDeviceToken(familyId, deviceId) {
+  return jwt.sign({ type: 'device', familyId, deviceId }, JWT_SECRET);
+}
+
+function verifyToken(token) {
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch (e) {
+    return null;
+  }
+}
+
+function familyRoom(familyId) {
+  return 'family:' + familyId;
+}
+
 const DB_FILE = path.join(__dirname, 'database.json');
 
-// Carrega ou inicializa banco de dados em arquivo
-function loadDatabase() {
-  if (fs.existsSync(DB_FILE)) {
-    try {
-      return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-    } catch (e) {
-      console.error('Erro ao ler banco de dados, reiniciando:', e);
-    }
-  }
+/**
+ * Forma de uma família nova (recém-cadastrada) — mesmos campos que db.rules/etc tinham
+ * na raiz antes do login existir, mas sem os dados de demonstração (sites/cercas de
+ * exemplo) que faziam sentido pra 1 instalação de teste, não pra uma família real nova
+ * entrando num sistema que agora serve várias.
+ */
+function familyDefaults() {
   return {
     pairedDevices: {}, // idDispositivo -> dados do dispositivo
-    activePairingCodes: {}, // pairingCode -> { serverUrl, createdAt, expiresAt }
     rules: {
       dailyLimitMinutes: 120,
       isPauseAllActive: false,
@@ -77,13 +116,10 @@ function loadDatabase() {
       contentFilter: {
         blockAdultContent: true,
         forceSafeSearch: true,
-        blockedDomains: ['siteimproprio.com', 'apostas.com'],
+        blockedDomains: [],
         blockedKeywords: ['violencia', 'aposta', 'cassino']
       },
-      geofences: [
-        { id: 'gf-1', name: 'Escola', latitude: -23.551520, longitude: -46.634308, radiusMeters: 200, status: 'inside' },
-        { id: 'gf-2', name: 'Casa', latitude: -23.550520, longitude: -46.633308, radiusMeters: 150, status: 'inside' }
-      ],
+      geofences: [],
       // Tarefas diárias: modo 'off' preserva o comportamento atual (limite fixo manual).
       // 'earn' = cada tarefa aprovada soma minutos ao dia; 'all_or_nothing' = aparelho
       // travado até todas as tarefas de hoje serem aprovadas.
@@ -116,6 +152,45 @@ function loadDatabase() {
   };
 }
 
+/**
+ * Bancos salvos antes do multi-tenant existir tinham pairedDevices/rules/etc soltos na
+ * raiz (uma família só, implícita, sem conta nenhuma). Migra isso pra dentro de
+ * families[LEGACY_FAMILY_ID] — preserva o pareamento real que já estava em produção
+ * (Moto G60 + Galaxy A06) sem exigir reparear do zero quando a 1ª conta for criada
+ * (ver /api/auth/register, que faz essa família ser herdada pelo primeiro cadastro).
+ */
+function migrateToMultiTenant(loaded) {
+  if (loaded.families) return loaded; // já está no formato novo, nada a fazer
+  const { pairedDevices, activePairingCodes, rules, taskInstances, timeRequests } = loaded;
+  return {
+    users: {},
+    activePairingCodes: activePairingCodes || {},
+    families: {
+      [LEGACY_FAMILY_ID]: {
+        pairedDevices: pairedDevices || {},
+        rules: rules || familyDefaults().rules,
+        taskInstances: taskInstances || { date: null, items: [] },
+        timeRequests: timeRequests || []
+      }
+    }
+  };
+}
+
+// Carrega ou inicializa banco de dados em arquivo
+function loadDatabase() {
+  if (fs.existsSync(DB_FILE)) {
+    try {
+      const loaded = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+      return migrateToMultiTenant(loaded);
+    } catch (e) {
+      console.error('Erro ao ler banco de dados, reiniciando:', e);
+    }
+  }
+  // Deploy 100% novo: sem família legada nenhuma pra herdar — a 1ª conta cadastrada
+  // cria sua própria família vazia (ver /api/auth/register).
+  return { users: {}, activePairingCodes: {}, families: {} };
+}
+
 function saveDatabase(db) {
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
@@ -126,34 +201,39 @@ function saveDatabase(db) {
 
 let db = loadDatabase();
 
-// Backfill de bancos salvos antes de features mais novas existirem, pra não quebrar
-// leituras de um database.json antigo.
-if (db.rules.taskUnlockMode === undefined) db.rules.taskUnlockMode = 'off';
-if (!Array.isArray(db.rules.dailyTasks)) db.rules.dailyTasks = [];
-if (!db.taskInstances) db.taskInstances = { date: null, items: [] };
-if (db.rules.unlockPinHash === undefined) db.rules.unlockPinHash = null;
-if (db.rules.lastPinUnlockAt === undefined) db.rules.lastPinUnlockAt = null;
-if (db.rules.locationUpdateRequested === undefined) db.rules.locationUpdateRequested = false;
-if (db.rules.deviceSyncRequested === undefined) db.rules.deviceSyncRequested = false;
-if (db.rules.resetUsageRequested === undefined) db.rules.resetUsageRequested = false;
-if (db.rules.emergencyPhone === undefined) db.rules.emergencyPhone = null;
+/** Backfill de famílias salvas antes de features mais novas existirem, pra não quebrar
+ * leituras de dados antigos — mesma ideia do backfill que existia solto na raiz antes,
+ * só que agora roda pra cada família (a legada e quaisquer outras já cadastradas). */
+function backfillFamilyDefaults(family) {
+  if (family.rules.taskUnlockMode === undefined) family.rules.taskUnlockMode = 'off';
+  if (!Array.isArray(family.rules.dailyTasks)) family.rules.dailyTasks = [];
+  if (!family.taskInstances) family.taskInstances = { date: null, items: [] };
+  if (family.rules.unlockPinHash === undefined) family.rules.unlockPinHash = null;
+  if (family.rules.lastPinUnlockAt === undefined) family.rules.lastPinUnlockAt = null;
+  if (family.rules.locationUpdateRequested === undefined) family.rules.locationUpdateRequested = false;
+  if (family.rules.deviceSyncRequested === undefined) family.rules.deviceSyncRequested = false;
+  if (family.rules.resetUsageRequested === undefined) family.rules.resetUsageRequested = false;
+  if (family.rules.emergencyPhone === undefined) family.rules.emergencyPhone = null;
+  if (!family.timeRequests) family.timeRequests = [];
+}
+Object.values(db.families).forEach(backfillFamilyDefaults);
 
 function blankTaskItem(taskId) {
   return { taskId, status: 'pending', photoUrl: null, submittedAt: null, approvedAt: null, rejectedReason: null };
 }
 
 /**
- * Garante que db.taskInstances reflete o dia de hoje: se a data mudou desde a
+ * Garante que family.taskInstances reflete o dia de hoje: se a data mudou desde a
  * última chamada, recria a lista de status do zero a partir do template atual
- * (db.rules.dailyTasks) — cada dia começa com todas as tarefas 'pending'. Mesmo
+ * (family.rules.dailyTasks) — cada dia começa com todas as tarefas 'pending'. Mesmo
  * padrão de day-rollover usado no contador de tempo de tela do app da criança.
  */
-function ensureTasksForToday(db) {
+function ensureTasksForToday(family) {
   const today = new Date().toISOString().slice(0, 10); // yyyy-mm-dd
-  if (db.taskInstances.date === today) return;
-  db.taskInstances = {
+  if (family.taskInstances.date === today) return;
+  family.taskInstances = {
     date: today,
-    items: db.rules.dailyTasks.map(task => blankTaskItem(task.id))
+    items: family.rules.dailyTasks.map(task => blankTaskItem(task.id))
   };
 }
 
@@ -162,10 +242,10 @@ function ensureTasksForToday(db) {
  * partir de parent:set_task_config, no meio do dia): mantém o progresso das tarefas
  * que continuam existindo, adiciona 'pending' pras novas e descarta as removidas.
  */
-function syncTaskInstancesWithTemplate(db) {
-  ensureTasksForToday(db);
-  const existingById = new Map(db.taskInstances.items.map(item => [item.taskId, item]));
-  db.taskInstances.items = db.rules.dailyTasks.map(task => existingById.get(task.id) || blankTaskItem(task.id));
+function syncTaskInstancesWithTemplate(family) {
+  ensureTasksForToday(family);
+  const existingById = new Map(family.taskInstances.items.map(item => [item.taskId, item]));
+  family.taskInstances.items = family.rules.dailyTasks.map(task => existingById.get(task.id) || blankTaskItem(task.id));
 }
 
 const server = http.createServer(app);
@@ -173,13 +253,75 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-// Endpoint: Gerar novo código de pareamento QR Code para o Pai
+// ============================== ENDPOINTS DE CONTA ==============================
+// Só o app do Pai loga (email+senha por enquanto). "googleId" já existe no usuário desde
+// já (sempre null) — quando o login com Google for ligado, um POST /api/auth/google novo
+// só precisa achar-ou-criar o usuário por email/googleId e devolver o mesmo formato de
+// token dos dois endpoints abaixo; nenhuma peça do resto do app precisa mudar de novo.
+
+app.post('/api/auth/register', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  if (!email || !email.includes('@')) {
+    return res.status(400).json({ success: false, message: 'Digite um email válido.' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ success: false, message: 'A senha precisa ter pelo menos 6 caracteres.' });
+  }
+  if (Object.values(db.users).some(u => u.email === email)) {
+    return res.status(409).json({ success: false, message: 'Já existe uma conta com esse email.' });
+  }
+
+  const isFirstAccountEver = Object.keys(db.users).length === 0;
+  const userId = 'user-' + Date.now();
+  // A 1ª conta cadastrada no backend herda a família legada (o pareamento real que já
+  // existia antes de contas existirem) — as seguintes criam famílias vazias normalmente.
+  const familyId = (isFirstAccountEver && db.families[LEGACY_FAMILY_ID]) ? LEGACY_FAMILY_ID : userId;
+  if (!db.families[familyId]) db.families[familyId] = familyDefaults();
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  const user = { id: userId, email, passwordHash, googleId: null, familyId, createdAt: new Date().toISOString() };
+  db.users[userId] = user;
+  saveDatabase(db);
+
+  res.json({ success: true, token: signUserToken(user) });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  const user = Object.values(db.users).find(u => u.email === email);
+  if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+    return res.status(401).json({ success: false, message: 'Email ou senha incorretos.' });
+  }
+  res.json({ success: true, token: signUserToken(user) });
+});
+
+/** Usado no boot dos apps do Pai pra decidir se mostra o popup de login/cadastro
+ * (token ausente/inválido/expirado) ou vai direto pro painel (token ok). */
+app.get('/api/auth/me', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const payload = token && verifyToken(token);
+  const user = payload && db.users[payload.userId];
+  if (!user) return res.status(401).json({ success: false });
+  res.json({ success: true, email: user.email });
+});
+
+// Endpoint: Gerar novo código de pareamento QR Code para o Pai (variante REST — a
+// variante Socket.IO abaixo, parent:request_pair_code, é a que os dois apps do Pai usam
+// de verdade hoje; esta fica de reserva/compatibilidade, também exigindo login).
 app.post('/api/pair/generate', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const payload = token && verifyToken(token);
+  if (!payload?.userId) return res.status(401).json({ success: false, message: 'Faça login primeiro.' });
+
   const code = 'GS-' + Math.floor(1000 + Math.random() * 9000);
   const serverUrl = req.body.serverUrl || 'http://192.168.1.114:3001';
-  
+
   db.activePairingCodes[code] = {
-    code,
+    familyId: payload.familyId,
     serverUrl,
     createdAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString() // expira em 15min
@@ -193,17 +335,19 @@ app.post('/api/pair/generate', (req, res) => {
   });
 });
 
-// Endpoint: Validar pareamento feito pelo Filho
-app.post('/api/pair/verify', (req, res) => {
-  const { code, deviceInfo } = req.body;
+/** Confirma um código de pareamento (código -> familyId) e cadastra o dispositivo
+ * dentro daquela família, devolvendo um deviceToken pro Filho persistir e usar em toda
+ * chamada HTTP dali em diante. Compartilhado entre a rota REST abaixo e o socket
+ * child:verify_pair_code (o app do Filho usa o socket; a REST fica de reserva). */
+function completePairing(code, deviceInfo) {
   const pairingData = db.activePairingCodes[code];
+  if (!pairingData) return { success: false, message: 'Código de pareamento inválido ou expirado.' };
 
-  if (!pairingData) {
-    return res.status(400).json({ success: false, message: 'Código de pareamento inválido ou expirado.' });
-  }
+  const family = db.families[pairingData.familyId];
+  if (!family) return { success: false, message: 'Código de pareamento inválido ou expirado.' };
 
   const deviceId = deviceInfo?.id || 'child-' + Date.now();
-  db.pairedDevices[deviceId] = {
+  family.pairedDevices[deviceId] = {
     id: deviceId,
     name: deviceInfo?.name || 'Dispositivo do Filho',
     model: deviceInfo?.model || 'Android',
@@ -217,36 +361,44 @@ app.post('/api/pair/verify', (req, res) => {
   delete db.activePairingCodes[code];
   saveDatabase(db);
 
-  io.emit('device:paired', db.pairedDevices[deviceId]);
-  io.emit('state:update', getGlobalState());
+  io.to(familyRoom(pairingData.familyId)).emit('device:paired', family.pairedDevices[deviceId]);
+  io.to(familyRoom(pairingData.familyId)).emit('state:update', getFamilyState(family));
 
-  res.json({
+  return {
     success: true,
     deviceId,
+    deviceToken: signDeviceToken(pairingData.familyId, deviceId),
     message: 'Dispositivo pareado com sucesso!'
-  });
+  };
+}
+
+// Endpoint: Validar pareamento feito pelo Filho (variante REST — ver completePairing)
+app.post('/api/pair/verify', (req, res) => {
+  const { code, deviceInfo } = req.body;
+  const result = completePairing(code, deviceInfo);
+  res.status(result.success ? 200 : 400).json(result);
 });
 
 /**
  * Limite diário efetivo pro dia de hoje: no modo 'earn', é a soma dos minutos das
  * tarefas já aprovadas hoje (sem tarefa aprovada = 0); nos outros modos, é o valor
- * fixo configurado manualmente (db.rules.dailyLimitMinutes), sem alterá-lo — assim
+ * fixo configurado manualmente (family.rules.dailyLimitMinutes), sem alterá-lo — assim
  * trocar de modo não faz o pai perder a configuração manual de volta.
  */
-function computeEffectiveDailyLimitMinutes(db) {
-  if (db.rules.taskUnlockMode === 'earn') {
-    const rewardById = new Map(db.rules.dailyTasks.map(t => [t.id, t.rewardMinutes || 0]));
-    return db.taskInstances.items
+function computeEffectiveDailyLimitMinutes(family) {
+  if (family.rules.taskUnlockMode === 'earn') {
+    const rewardById = new Map(family.rules.dailyTasks.map(t => [t.id, t.rewardMinutes || 0]));
+    return family.taskInstances.items
       .filter(item => item.status === 'approved')
       .reduce((sum, item) => sum + (rewardById.get(item.taskId) || 0), 0);
   }
-  return db.rules.dailyLimitMinutes;
+  return family.rules.dailyLimitMinutes;
 }
 
 /**
  * Distância em metros entre duas coordenadas (fórmula de Haversine) — usada pra
  * calcular se a criança está dentro ou fora de uma cerca virtual (ver geofences em
- * getGlobalState()).
+ * getFamilyState()).
  */
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000; // raio da Terra em metros
@@ -284,19 +436,19 @@ function isWithinSchedule(schedule) {
  * agora. Usado tanto pra decidir o bloqueio de verdade (isScheduledBlockActive em
  * /api/tasks/sync) quanto pra saber a mensagem certa (rótulo + horário de término).
  */
-function activeScheduleBlock() {
-  if (isWithinSchedule(db.rules.bedtimeSchedule)) {
-    return { label: '🌙 Horário de Dormir', endsAt: db.rules.bedtimeSchedule.end };
+function activeScheduleBlock(family) {
+  if (isWithinSchedule(family.rules.bedtimeSchedule)) {
+    return { label: '🌙 Horário de Dormir', endsAt: family.rules.bedtimeSchedule.end };
   }
-  if (isWithinSchedule(db.rules.studySchedule)) {
-    return { label: '📚 Horário de Estudo', endsAt: db.rules.studySchedule.end };
+  if (isWithinSchedule(family.rules.studySchedule)) {
+    return { label: '📚 Horário de Estudo', endsAt: family.rules.studySchedule.end };
   }
   return null;
 }
 
-function getGlobalState() {
-  ensureTasksForToday(db);
-  const devicesList = Object.values(db.pairedDevices);
+function getFamilyState(family) {
+  ensureTasksForToday(family);
+  const devicesList = Object.values(family.pairedDevices);
   const primaryChild = devicesList[0] || {
     id: 'demo-child',
     name: 'Aguardando Pareamento...',
@@ -311,21 +463,21 @@ function getGlobalState() {
     pairedDevices: devicesList,
     deviceInfo: primaryChild,
     screenTime: {
-      dailyLimitMinutes: computeEffectiveDailyLimitMinutes(db),
+      dailyLimitMinutes: computeEffectiveDailyLimitMinutes(family),
       usedMinutesToday: primaryChild.usedMinutesToday || 0,
-      isPauseAllActive: db.rules.isPauseAllActive,
-      bedtimeSchedule: db.rules.bedtimeSchedule,
-      studySchedule: db.rules.studySchedule,
+      isPauseAllActive: family.rules.isPauseAllActive,
+      bedtimeSchedule: family.rules.bedtimeSchedule,
+      studySchedule: family.rules.studySchedule,
       // O hash em si nunca é exposto pro app do pai, só se existe um cadastrado —
       // o pai não precisa (nem deve) conseguir ler o PIN de volta.
-      hasUnlockPin: Boolean(db.rules.unlockPinHash),
-      lastPinUnlockAt: db.rules.lastPinUnlockAt,
+      hasUnlockPin: Boolean(family.rules.unlockPinHash),
+      lastPinUnlockAt: family.rules.lastPinUnlockAt,
       // Vai pro app do Filho como está (não é sensível como o PIN) — usado pelo
       // botão "Chamada de Emergência" da tela de bloqueio (tel: link).
-      emergencyPhone: db.rules.emergencyPhone
+      emergencyPhone: family.rules.emergencyPhone
     },
-    blockedApps: db.rules.blockedApps.length > 0 ? db.rules.blockedApps : (primaryChild.installedApps || []),
-    contentFilter: db.rules.contentFilter,
+    blockedApps: family.rules.blockedApps.length > 0 ? family.rules.blockedApps : (primaryChild.installedApps || []),
+    contentFilter: family.rules.contentFilter,
     location: primaryChild.location || {
       latitude: -23.550520,
       longitude: -46.633308,
@@ -334,17 +486,17 @@ function getGlobalState() {
     },
     // Status calculado de verdade contra a posição atual da criança (antes era um
     // valor fixo no seed, nunca recalculado) — 'unknown' se ainda não há GPS.
-    geofences: db.rules.geofences.map(gf => ({
+    geofences: family.rules.geofences.map(gf => ({
       ...gf,
       status: primaryChild.location
         ? (haversineMeters(primaryChild.location.latitude, primaryChild.location.longitude, gf.latitude, gf.longitude) <= gf.radiusMeters ? 'inside' : 'outside')
         : 'unknown'
     })),
-    timeRequests: db.timeRequests,
+    timeRequests: family.timeRequests,
     tasks: {
-      unlockMode: db.rules.taskUnlockMode,
-      dailyTasks: db.rules.dailyTasks,
-      todayStatus: db.taskInstances.items
+      unlockMode: family.rules.taskUnlockMode,
+      dailyTasks: family.rules.dailyTasks,
+      todayStatus: family.taskInstances.items
     }
   };
 }
@@ -361,41 +513,62 @@ function getGlobalState() {
 // porque a WebView praticamente nunca fica aberta no uso normal — a criança usa a
 // Home/Gaveta nativas). Por isso /api/tasks/sync agora também devolve essas regras,
 // e o ParentalAccessibilityService as grava direto no SharedPreferences a cada poll.
+//
+// Multi-tenant: todo endpoint abaixo resolve a família a partir de um "deviceToken"
+// (header X-Device-Token ou ?deviceToken=, emitido no pareamento — ver completePairing).
+// Sem token nenhum, cai na família legada — é o que mantém o app do Filho ainda não
+// atualizado funcionando exatamente como hoje enquanto o rollout não estiver completo
+// nos 3 apps (ver plano de migração).
+
+/** Resolve a família de uma chamada do dispositivo — nunca falha (cai na família
+ * legada sem token), pra não quebrar o app do Filho ainda não atualizado. */
+function resolveDeviceFamily(req) {
+  const token = req.headers['x-device-token'] || req.query.deviceToken;
+  if (token) {
+    const payload = verifyToken(token);
+    if (payload?.type === 'device' && payload.familyId && db.families[payload.familyId]) {
+      return { family: db.families[payload.familyId], familyId: payload.familyId };
+    }
+  }
+  if (!db.families[LEGACY_FAMILY_ID]) db.families[LEGACY_FAMILY_ID] = familyDefaults();
+  return { family: db.families[LEGACY_FAMILY_ID], familyId: LEGACY_FAMILY_ID };
+}
 
 // Consultado a cada ~60s pelo ParentalAccessibilityService: resposta enxuta, só com
 // o que o nativo precisa pra atualizar a Home e decidir se bloqueia o aparelho.
 app.get('/api/tasks/sync', (req, res) => {
-  ensureTasksForToday(db);
-  const scheduleBlock = activeScheduleBlock();
+  const { family } = resolveDeviceFamily(req);
+  ensureTasksForToday(family);
+  const scheduleBlock = activeScheduleBlock(family);
   res.json({
-    unlockMode: db.rules.taskUnlockMode,
-    dailyLimitMinutes: computeEffectiveDailyLimitMinutes(db),
-    dailyTasks: db.rules.dailyTasks,
-    todayStatus: db.taskInstances.items,
-    isPauseAllActive: db.rules.isPauseAllActive,
-    blockedPackages: db.rules.blockedApps.filter(a => a.isBlocked).map(a => a.id),
+    unlockMode: family.rules.taskUnlockMode,
+    dailyLimitMinutes: computeEffectiveDailyLimitMinutes(family),
+    dailyTasks: family.rules.dailyTasks,
+    todayStatus: family.taskInstances.items,
+    isPauseAllActive: family.rules.isPauseAllActive,
+    blockedPackages: family.rules.blockedApps.filter(a => a.isBlocked).map(a => a.id),
     // Apps que o pai marcou como "sempre disponível" — o nativo libera esses pacotes
     // mesmo com Pausa Geral, tarefas pendentes, tempo esgotado ou bloqueio individual
     // ativos (ver reevaluateBlockState em ParentalAccessibilityService.kt).
-    alwaysAvailablePackages: db.rules.blockedApps.filter(a => a.isAlwaysAvailable).map(a => a.id),
+    alwaysAvailablePackages: family.rules.blockedApps.filter(a => a.isAlwaysAvailable).map(a => a.id),
     // Horário de Dormir/Estudo: bloqueio de verdade agora (calculado com o relógio do
     // servidor — ver activeScheduleBlock), + os horários brutos pro nativo saber mostrar
     // "próximo bloqueio agendado" na Home mesmo quando nada está bloqueando ainda.
     scheduledBlockActive: scheduleBlock !== null,
     scheduledBlockLabel: scheduleBlock ? scheduleBlock.label : null,
     scheduledBlockEndsAt: scheduleBlock ? scheduleBlock.endsAt : null,
-    bedtimeSchedule: db.rules.bedtimeSchedule,
-    studySchedule: db.rules.studySchedule,
+    bedtimeSchedule: family.rules.bedtimeSchedule,
+    studySchedule: family.rules.studySchedule,
     // Hash SHA-256 do PIN de emergência (nunca o valor em texto puro) — o nativo
     // guarda isso localmente e faz a checagem 100% offline (ver LockOverlayService).
-    unlockPinHash: db.rules.unlockPinHash,
-    locationUpdateRequested: db.rules.locationUpdateRequested,
-    deviceSyncRequested: db.rules.deviceSyncRequested,
-    resetUsageRequested: db.rules.resetUsageRequested,
+    unlockPinHash: family.rules.unlockPinHash,
+    locationUpdateRequested: family.rules.locationUpdateRequested,
+    deviceSyncRequested: family.rules.deviceSyncRequested,
+    resetUsageRequested: family.rules.resetUsageRequested,
     // Telefone do botão "Chamada de Emergência" — faltava aqui (só ia pro app do Pai via
     // socket.io); sem isso o nativo nunca sincronizava e o botão não tinha como existir
     // de verdade na tela de bloqueio nem na Home (ver LockOverlayService/LauncherHomeActivity).
-    emergencyPhone: db.rules.emergencyPhone
+    emergencyPhone: family.rules.emergencyPhone
   });
 });
 
@@ -403,9 +576,10 @@ app.get('/api/tasks/sync', (req, res) => {
 // a resetUsageRequested (ver parent:reset_daily_usage) — confirma pro backend que já foi
 // feito de verdade, pra parar de mandar o pedido nos próximos polls.
 app.post('/api/device/reset-usage-ack', (req, res) => {
-  db.rules.resetUsageRequested = false;
+  const { family, familyId } = resolveDeviceFamily(req);
+  family.rules.resetUsageRequested = false;
   saveDatabase(db);
-  io.emit('state:update', getGlobalState());
+  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   res.json({ success: true });
 });
 
@@ -414,16 +588,17 @@ app.post('/api/device/reset-usage-ack', (req, res) => {
 // acima). Espelha reconcileInstalledApps, mas pra posição.
 app.post('/api/device/location-sync', (req, res) => {
   const { latitude, longitude, accuracy } = req.body || {};
-  const dev = Object.values(db.pairedDevices)[0];
+  const { family, familyId } = resolveDeviceFamily(req);
+  const dev = Object.values(family.pairedDevices)[0];
   if (!dev || latitude == null || longitude == null) {
     return res.json({ success: false });
   }
   dev.location = { latitude, longitude, accuracy, lastUpdated: new Date().toISOString() };
-  db.rules.locationUpdateRequested = false;
+  family.rules.locationUpdateRequested = false;
   dev.lastSeen = new Date().toISOString();
   dev.isOnline = true;
   saveDatabase(db);
-  io.emit('state:update', getGlobalState());
+  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   res.json({ success: true });
 });
 
@@ -433,7 +608,8 @@ app.post('/api/device/location-sync', (req, res) => {
 // (WebView), que quase nunca abre no uso normal — ficavam desatualizados por dias.
 app.post('/api/device/telemetry-sync', (req, res) => {
   const { batteryLevel, networkType, deviceModel, usedMinutesToday } = req.body || {};
-  const dev = Object.values(db.pairedDevices)[0];
+  const { family, familyId } = resolveDeviceFamily(req);
+  const dev = Object.values(family.pairedDevices)[0];
   if (!dev) {
     return res.json({ success: false });
   }
@@ -447,11 +623,11 @@ app.post('/api/device/telemetry-sync', (req, res) => {
   if (typeof usedMinutesToday === 'number' && usedMinutesToday >= 0) {
     dev.usedMinutesToday = usedMinutesToday;
   }
-  db.rules.deviceSyncRequested = false;
+  family.rules.deviceSyncRequested = false;
   dev.lastSeen = new Date().toISOString();
   dev.isOnline = true;
   saveDatabase(db);
-  io.emit('state:update', getGlobalState());
+  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   res.json({ success: true });
 });
 
@@ -460,10 +636,11 @@ app.post('/api/device/telemetry-sync', (req, res) => {
 // só pra manter o painel do pai consistente com o que já aconteceu de verdade no
 // aparelho (a criança já foi desbloqueada localmente antes disso chegar aqui).
 app.post('/api/device/pin-unlock-ack', (req, res) => {
-  db.rules.isPauseAllActive = false;
-  db.rules.lastPinUnlockAt = new Date().toISOString();
+  const { family, familyId } = resolveDeviceFamily(req);
+  family.rules.isPauseAllActive = false;
+  family.rules.lastPinUnlockAt = new Date().toISOString();
   saveDatabase(db);
-  io.emit('state:update', getGlobalState());
+  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   res.json({ success: true });
 });
 
@@ -473,10 +650,10 @@ app.post('/api/device/pin-unlock-ack', (req, res) => {
  * instalado sai (antes só juntava, nunca removia). Compartilhado entre o socket
  * 'child:telemetry' (WebView) e POST /api/device/apps-sync (nativo, sempre vivo).
  */
-function reconcileInstalledApps(dev, installedApps) {
+function reconcileInstalledApps(family, dev, installedApps) {
   dev.installedApps = installedApps;
-  const previousById = new Map(db.rules.blockedApps.map(a => [a.id, a]));
-  db.rules.blockedApps = installedApps.map(app => {
+  const previousById = new Map(family.rules.blockedApps.map(a => [a.id, a]));
+  family.rules.blockedApps = installedApps.map(app => {
     const appId = app.id || app.package;
     const existing = previousById.get(appId);
     return {
@@ -497,25 +674,27 @@ function reconcileInstalledApps(dev, installedApps) {
 // chegava ao backend quando a WebView mandava telemetria, e a WebView raramente abre.
 app.post('/api/device/apps-sync', (req, res) => {
   const { installedApps } = req.body || {};
-  const dev = Object.values(db.pairedDevices)[0];
+  const { family, familyId } = resolveDeviceFamily(req);
+  const dev = Object.values(family.pairedDevices)[0];
   if (!dev || !Array.isArray(installedApps)) {
     return res.json({ success: false });
   }
-  reconcileInstalledApps(dev, installedApps);
+  reconcileInstalledApps(family, dev, installedApps);
   dev.lastSeen = new Date().toISOString();
   dev.isOnline = true;
   saveDatabase(db);
-  io.emit('state:update', getGlobalState());
+  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   res.json({ success: true });
 });
 
 // Chamado pela Home nativa depois de tirar a foto de comprovação de uma tarefa.
 // Corpo: { photoBase64: "data:image/jpeg;base64,...." ou só o base64 puro }.
 app.post('/api/tasks/:taskId/submit', (req, res) => {
-  ensureTasksForToday(db);
+  const { family, familyId } = resolveDeviceFamily(req);
+  ensureTasksForToday(family);
   const { taskId } = req.params;
   const { photoBase64 } = req.body || {};
-  const item = db.taskInstances.items.find(i => i.taskId === taskId);
+  const item = family.taskInstances.items.find(i => i.taskId === taskId);
 
   if (!item) {
     return res.status(404).json({ success: false, message: 'Tarefa não encontrada para hoje.' });
@@ -535,8 +714,8 @@ app.post('/api/tasks/:taskId/submit', (req, res) => {
     item.rejectedReason = null;
     saveDatabase(db);
 
-    io.emit('state:update', getGlobalState());
-    io.emit('notification:new_task_submission', item);
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    io.to(familyRoom(familyId)).emit('notification:new_task_submission', item);
     res.json({ success: true, item });
   } catch (e) {
     console.error('Erro ao salvar foto de tarefa:', e);
@@ -544,18 +723,43 @@ app.post('/api/tasks/:taskId/submit', (req, res) => {
   }
 });
 
-io.on('connection', (socket) => {
-  console.log('🔗 Conexão Socket.IO:', socket.id);
+// ============================== SOCKET.IO (app do Pai) ==============================
+// Todo socket precisa resolver uma família antes de qualquer coisa — ver o middleware
+// abaixo. Compatibilidade: conexão sem token cai na família legada (mesmo comportamento
+// único de hoje), até que o app do Pai (React e nativo) estejam 100% migrados pra
+// exigir login sempre; só então esse fallback deve ser removido.
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (token) {
+    const payload = verifyToken(token);
+    if (payload?.userId && payload?.familyId) {
+      socket.data.familyId = payload.familyId;
+      if (!db.families[socket.data.familyId]) db.families[socket.data.familyId] = familyDefaults();
+      return next();
+    }
+  }
+  socket.data.familyId = LEGACY_FAMILY_ID;
+  if (!db.families[LEGACY_FAMILY_ID]) db.families[LEGACY_FAMILY_ID] = familyDefaults();
+  next();
+});
 
-  socket.emit('state:update', getGlobalState());
+io.on('connection', (socket) => {
+  const familyId = socket.data.familyId;
+  const family = db.families[familyId];
+  // Sala por família: é o que impede o 'state:update' de uma família vazar pra outra
+  // (ver toda chamada io.to(familyRoom(...)).emit abaixo, em vez de io.emit puro).
+  socket.join(familyRoom(familyId));
+  console.log(`🔗 Conexão Socket.IO: ${socket.id} (família: ${familyId})`);
+
+  socket.emit('state:update', getFamilyState(family));
 
   // Gerar QR Code via Socket.IO (instantâneo e sem erro de CORS/HTTP)
   socket.on('parent:request_pair_code', (data) => {
     const code = 'GS-' + Math.floor(1000 + Math.random() * 9000);
     const serverUrl = data?.serverUrl || 'http://192.168.1.114:3001';
-    
+
     db.activePairingCodes[code] = {
-      code,
+      familyId,
       serverUrl,
       createdAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString()
@@ -567,76 +771,50 @@ io.on('connection', (socket) => {
       pairingCode: code,
       qrPayload: JSON.stringify({ code, serverUrl })
     });
-    console.log(`⚡ Código de pareamento ${code} gerado via Socket.IO`);
+    console.log(`⚡ Código de pareamento ${code} gerado via Socket.IO (família: ${familyId})`);
   });
 
   // Validar pareamento do filho via Socket.IO
   socket.on('child:verify_pair_code', (data) => {
     const { code, deviceInfo } = data || {};
-    const pairingData = db.activePairingCodes[code];
-
-    if (!pairingData) {
-      socket.emit('child:pair_result', { success: false, message: 'Código de pareamento inválido ou expirado.' });
-      return;
+    const result = completePairing(code, deviceInfo);
+    socket.emit('child:pair_result', result);
+    if (result.success) {
+      console.log(`🎉 Dispositivo ${result.deviceId} pareado com sucesso via Socket.IO!`);
     }
-
-    const deviceId = deviceInfo?.id || 'child-' + Date.now();
-    db.pairedDevices[deviceId] = {
-      id: deviceId,
-      name: deviceInfo?.name || 'Dispositivo do Filho',
-      model: deviceInfo?.model || 'Android',
-      batteryLevel: deviceInfo?.batteryLevel || 100,
-      isOnline: true,
-      lastSeen: new Date().toISOString(),
-      usedMinutesToday: 0,
-      installedApps: deviceInfo?.installedApps || []
-    };
-
-    delete db.activePairingCodes[code];
-    saveDatabase(db);
-
-    io.emit('device:paired', db.pairedDevices[deviceId]);
-    io.emit('state:update', getGlobalState());
-
-    socket.emit('child:pair_result', {
-      success: true,
-      deviceId,
-      message: 'Dispositivo pareado com sucesso!'
-    });
-    console.log(`🎉 Dispositivo ${deviceId} pareado com sucesso via Socket.IO!`);
   });
 
   // Recebe dados REAIS de telemetria enviados pelo dispositivo do Filho
   socket.on('child:telemetry', (data) => {
     const { deviceId, deviceName, deviceModel, batteryLevel, usedMinutesToday, location, installedApps } = data || {};
-    if (deviceId && db.pairedDevices[deviceId]) {
-      const dev = db.pairedDevices[deviceId];
+    if (deviceId && family.pairedDevices[deviceId]) {
+      const dev = family.pairedDevices[deviceId];
       if (deviceName) dev.name = deviceName;
       if (deviceModel) dev.model = deviceModel;
       if (batteryLevel !== undefined) dev.batteryLevel = batteryLevel;
       if (usedMinutesToday !== undefined) dev.usedMinutesToday = usedMinutesToday;
       if (location) dev.location = location;
       if (Array.isArray(installedApps)) {
-        reconcileInstalledApps(dev, installedApps);
+        reconcileInstalledApps(family, dev, installedApps);
       }
       dev.lastSeen = new Date().toISOString();
       dev.isOnline = true;
       saveDatabase(db);
-      io.emit('state:update', getGlobalState());
+      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
     }
   });
 
   // Comandos dos Pais
   socket.on('parent:set_daily_limit', (minutes) => {
-    db.rules.dailyLimitMinutes = minutes;
+    family.rules.dailyLimitMinutes = minutes;
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   socket.on('parent:toggle_pause_all', (isPaused) => {
-    db.rules.isPauseAllActive = isPaused;
+    family.rules.isPauseAllActive = isPaused;
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   // PIN de emergência: só o hash SHA-256 é guardado — o valor em texto puro chega
@@ -645,49 +823,47 @@ io.on('connection', (socket) => {
   socket.on('parent:set_unlock_pin', (pin) => {
     const cleaned = String(pin || '').trim();
     if (cleaned.length < 4 || cleaned.length > 8) return;
-    db.rules.unlockPinHash = crypto.createHash('sha256').update(cleaned).digest('hex');
+    family.rules.unlockPinHash = crypto.createHash('sha256').update(cleaned).digest('hex');
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   // Telefone que o botão "Chamada de Emergência" (tela de bloqueio do Filho) disca
   // via tel: — ao contrário do PIN, não é sensível, então guarda em texto puro mesmo.
   socket.on('parent:set_emergency_phone', (phone) => {
     const cleaned = String(phone || '').trim();
-    db.rules.emergencyPhone = cleaned || null;
+    family.rules.emergencyPhone = cleaned || null;
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
-  // Horário de Dormir/Estudo: só persiste (mostrado no app do Filho) — ainda não
-  // bloqueia o aparelho nesses horários, por decisão explícita (fica pra uma
-  // rodada futura, mexer em enforcement é risco maior que reestilizar).
+  // Horário de Dormir/Estudo: bloqueia de verdade (ver activeScheduleBlock/isWithinSchedule)
   socket.on('parent:set_schedule', ({ key, enabled, start, end }) => {
     if (key !== 'bedtimeSchedule' && key !== 'studySchedule') return;
-    const current = db.rules[key] || {};
-    db.rules[key] = {
+    const current = family.rules[key] || {};
+    family.rules[key] = {
       enabled: typeof enabled === 'boolean' ? enabled : current.enabled,
       start: start || current.start,
       end: end || current.end
     };
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   // Pede que o aparelho busque uma localização fresca (GPS ativo) no próximo poll,
   // em vez de só reenviar a última posição em cache — ver locationUpdateRequested.
   socket.on('parent:request_location_update', () => {
-    db.rules.locationUpdateRequested = true;
+    family.rules.locationUpdateRequested = true;
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   // Botão de sincronizar do header do app do Pai: pede que o nativo reenvie
   // bateria/wifi/modelo no próximo poll (~1min) — ver deviceSyncRequested.
   socket.on('parent:request_device_sync', () => {
-    db.rules.deviceSyncRequested = true;
+    family.rules.deviceSyncRequested = true;
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   // "Zerar tempo usado hoje" — pro pai corrigir depois de usar o tempo da criança
@@ -695,19 +871,19 @@ io.on('connection', (socket) => {
   // e pede que o nativo zere o contador LOCAL de verdade (GuardianPrefs, é quem decide o
   // bloqueio por tempo esgotado) no próximo poll — ver resetUsageRequested/reset-usage-ack.
   socket.on('parent:reset_daily_usage', () => {
-    db.rules.resetUsageRequested = true;
-    const dev = Object.values(db.pairedDevices)[0];
+    family.rules.resetUsageRequested = true;
+    const dev = Object.values(family.pairedDevices)[0];
     if (dev) dev.usedMinutesToday = 0;
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   socket.on('parent:toggle_app_block', ({ appId, isBlocked }) => {
-    const app = db.rules.blockedApps.find(a => a.id === appId);
-    if (app) {
-      app.isBlocked = isBlocked;
+    const targetApp = family.rules.blockedApps.find(a => a.id === appId);
+    if (targetApp) {
+      targetApp.isBlocked = isBlocked;
       saveDatabase(db);
-      io.emit('state:update', getGlobalState());
+      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
     }
   });
 
@@ -717,32 +893,32 @@ io.on('connection', (socket) => {
   // marcado como bloqueado E sempre-disponível ao mesmo tempo sem conflito, porque
   // é o always-available que vence no nativo (checado antes de tudo o mais).
   socket.on('parent:toggle_app_always_available', ({ appId, isAlwaysAvailable }) => {
-    const app = db.rules.blockedApps.find(a => a.id === appId);
-    if (app) {
-      app.isAlwaysAvailable = isAlwaysAvailable;
+    const targetApp = family.rules.blockedApps.find(a => a.id === appId);
+    if (targetApp) {
+      targetApp.isAlwaysAvailable = isAlwaysAvailable;
       saveDatabase(db);
-      io.emit('state:update', getGlobalState());
+      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
     }
   });
 
   socket.on('parent:add_blocked_domain', (domain) => {
-    if (domain && !db.rules.contentFilter.blockedDomains.includes(domain)) {
-      db.rules.contentFilter.blockedDomains.push(domain);
+    if (domain && !family.rules.contentFilter.blockedDomains.includes(domain)) {
+      family.rules.contentFilter.blockedDomains.push(domain);
       saveDatabase(db);
-      io.emit('state:update', getGlobalState());
+      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
     }
   });
 
   socket.on('parent:respond_time_request', ({ requestId, approved, bonusMinutes }) => {
-    const reqItem = db.timeRequests.find(r => r.id === requestId);
+    const reqItem = family.timeRequests.find(r => r.id === requestId);
     if (reqItem) {
       reqItem.status = approved ? 'approved' : 'rejected';
       if (approved && bonusMinutes) {
-        db.rules.dailyLimitMinutes += bonusMinutes;
+        family.rules.dailyLimitMinutes += bonusMinutes;
       }
       saveDatabase(db);
-      io.emit('state:update', getGlobalState());
-      io.emit('notification:request_answered', { request: reqItem, approved, bonusMinutes });
+      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+      io.to(familyRoom(familyId)).emit('notification:request_answered', { request: reqItem, approved, bonusMinutes });
     }
   });
 
@@ -754,41 +930,41 @@ io.on('connection', (socket) => {
       requestedMinutes: requestedMinutes || 15,
       status: 'pending'
     };
-    db.timeRequests.unshift(newRequest);
+    family.timeRequests.unshift(newRequest);
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
-    io.emit('notification:new_time_request', newRequest);
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    io.to(familyRoom(familyId)).emit('notification:new_time_request', newRequest);
   });
 
   // Pai edita a lista de tarefas do dia e/ou o modo de bloqueio ('off' | 'earn' | 'all_or_nothing')
   socket.on('parent:set_task_config', ({ unlockMode, dailyTasks }) => {
     if (unlockMode && ['off', 'earn', 'all_or_nothing'].includes(unlockMode)) {
-      db.rules.taskUnlockMode = unlockMode;
+      family.rules.taskUnlockMode = unlockMode;
     }
     if (Array.isArray(dailyTasks)) {
-      db.rules.dailyTasks = dailyTasks.map(t => ({
+      family.rules.dailyTasks = dailyTasks.map(t => ({
         id: t.id || 'task-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
         title: t.title || 'Tarefa',
         icon: t.icon || '✅',
         rewardMinutes: Number(t.rewardMinutes) || 0
       }));
     }
-    syncTaskInstancesWithTemplate(db);
+    syncTaskInstancesWithTemplate(family);
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   // Pai cria uma nova cerca virtual ou edita uma existente (upsert por id; sem id = cria)
   socket.on('parent:save_geofence', ({ id, name, latitude, longitude, radiusMeters }) => {
     if (!name || latitude == null || longitude == null) return;
-    const existing = id && db.rules.geofences.find(g => g.id === id);
+    const existing = id && family.rules.geofences.find(g => g.id === id);
     if (existing) {
       existing.name = name;
       existing.latitude = latitude;
       existing.longitude = longitude;
       existing.radiusMeters = Number(radiusMeters) || existing.radiusMeters;
     } else {
-      db.rules.geofences.push({
+      family.rules.geofences.push({
         id: 'gf-' + Date.now(),
         name,
         latitude,
@@ -797,27 +973,27 @@ io.on('connection', (socket) => {
       });
     }
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   // Pai remove uma cerca virtual
   socket.on('parent:remove_geofence', ({ id }) => {
-    db.rules.geofences = db.rules.geofences.filter(g => g.id !== id);
+    family.rules.geofences = family.rules.geofences.filter(g => g.id !== id);
     saveDatabase(db);
-    io.emit('state:update', getGlobalState());
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   // Pai aprova ou recusa uma tarefa enviada pela criança
   socket.on('parent:respond_task', ({ taskId, approved, rejectedReason }) => {
-    ensureTasksForToday(db);
-    const item = db.taskInstances.items.find(i => i.taskId === taskId);
+    ensureTasksForToday(family);
+    const item = family.taskInstances.items.find(i => i.taskId === taskId);
     if (item) {
       item.status = approved ? 'approved' : 'rejected';
       item.approvedAt = approved ? new Date().toISOString() : null;
       item.rejectedReason = approved ? null : (rejectedReason || 'Tente novamente.');
       saveDatabase(db);
-      io.emit('state:update', getGlobalState());
-      io.emit('notification:task_reviewed', { item, approved });
+      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+      io.to(familyRoom(familyId)).emit('notification:task_reviewed', { item, approved });
     }
   });
 });
