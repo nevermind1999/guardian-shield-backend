@@ -67,4 +67,4 @@ async function sendPushToFamily(family, { title, body, data } = {}) {
   }
 }
 
-module.exports = { initFirebase, sendPushToFamily };
+module.exports = { initFirebase, sendPushToFamily, isPushInitialized: () => initialized };
