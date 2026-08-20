@@ -219,7 +219,7 @@ function backfillFamilyDefaults(family) {
 Object.values(db.families).forEach(backfillFamilyDefaults);
 
 function blankTaskItem(taskId) {
-  return { taskId, status: 'pending', photoUrl: null, submittedAt: null, approvedAt: null, rejectedReason: null };
+  return { taskId, status: 'pending', photoUrl: null, submittedAt: null, approvedAt: null, rejectedReason: null, snoozeUntil: null };
 }
 
 /**
@@ -1002,7 +1002,9 @@ io.on('connection', (socket) => {
     io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
-  // Pai aprova ou recusa uma tarefa enviada pela criança
+  // Pai aprova ou recusa uma tarefa enviada pela criança — funciona em qualquer status
+  // (inclusive 'pending', sem foto nenhuma: é o "marcar como feita mesmo sem a criança
+  // enviar a foto" pedido pelo pai).
   socket.on('parent:respond_task', ({ taskId, approved, rejectedReason }) => {
     ensureTasksForToday(family);
     const item = family.taskInstances.items.find(i => i.taskId === taskId);
@@ -1010,9 +1012,27 @@ io.on('connection', (socket) => {
       item.status = approved ? 'approved' : 'rejected';
       item.approvedAt = approved ? new Date().toISOString() : null;
       item.rejectedReason = approved ? null : (rejectedReason || 'Tente novamente.');
+      item.snoozeUntil = null; // resolvida — não faz mais sentido continuar "adiada"
       saveDatabase(db);
       io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
       io.to(familyRoom(familyId)).emit('notification:task_reviewed', { item, approved });
+    }
+  });
+
+  // "Adiar tarefa pra mais tarde no mesmo dia" — dá um tempo livre daquela tarefa
+  // específica: enquanto snoozeUntil não passar, o modo "tudo ou nada" do celular do
+  // filho para de contar ESSA tarefa como pendência bloqueante (ver isTaskGateBlocking
+  // em GuardianPrefs.kt, no app do Filho). O status continua 'pending' — só ganha essa
+  // janela de carência; depois de snoozeUntil passar volta a bloquear normalmente.
+  // `minutes` já vem calculado do app do Pai (inclui a opção "resto do dia").
+  socket.on('parent:snooze_task', ({ taskId, minutes }) => {
+    ensureTasksForToday(family);
+    const item = family.taskInstances.items.find(i => i.taskId === taskId);
+    const mins = Number(minutes);
+    if (item && mins > 0) {
+      item.snoozeUntil = Date.now() + mins * 60 * 1000;
+      saveDatabase(db);
+      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
     }
   });
 });
