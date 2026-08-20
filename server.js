@@ -1,3 +1,9 @@
+// Carrega backend/.env pra dentro de process.env — sem isso, JWT_SECRET/
+// FIREBASE_SERVICE_ACCOUNT no .env nunca chegavam no processo de verdade (o Node não lê
+// .env sozinho). Provável causa de JWT_SECRET estar caindo no fallback de dev em
+// produção até agora, e do push nunca ter funcionado mesmo com a credencial no arquivo.
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
