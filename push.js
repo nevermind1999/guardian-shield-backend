@@ -44,6 +44,10 @@ function initFirebase() {
  */
 async function sendPushToFamily(family, { title, body, data } = {}) {
   if (!initialized) return;
+  // Preferência do pai — cada tipo (data.type) pode estar desligado individualmente
+  // (ver parent:set_push_preferences em server.js). Tipo sem preferência salva ainda
+  // (undefined) conta como ligado — só desliga quem o pai desligou de propósito.
+  if (data?.type && family.rules.pushPreferences?.[data.type] === false) return;
   const tokens = family.rules.pushTokens || [];
   if (tokens.length === 0) return;
 

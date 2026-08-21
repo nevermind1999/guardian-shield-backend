@@ -115,6 +115,23 @@ function familyRoom(familyId) {
 
 const DB_FILE = path.join(__dirname, 'database.json');
 
+// Todo tipo de push que o servidor sabe mandar (o "type" que já vai em data.type em cada
+// chamada de sendPushToFamily) — fonte única usada tanto pro default de pushPreferences
+// quanto pra validar o que o app do Pai manda em parent:set_push_preferences, pra uma
+// chave desconhecida/digitada errado não entrar silenciosamente na família.
+const PUSH_NOTIFICATION_TYPES = [
+  'time_request',
+  'task_submitted',
+  'pin_unlock',
+  'new_app',
+  'geofence',
+  'tasks_pending_reminder'
+];
+
+function defaultPushPreferences() {
+  return Object.fromEntries(PUSH_NOTIFICATION_TYPES.map(type => [type, true]));
+}
+
 /**
  * Forma de uma família nova (recém-cadastrada) — mesmos campos que db.rules/etc tinham
  * na raiz antes do login existir, mas sem os dados de demonstração (sites/cercas de
@@ -168,7 +185,11 @@ function familyDefaults() {
       // reinstalou o app, trocou de aparelho, etc. Tokens inválidos/expirados são
       // removidos sozinhos quando o Firebase reporta erro nesse token (ver
       // sendPushToFamily).
-      pushTokens: []
+      pushTokens: [],
+      // Quais tipos de push o pai quer receber — todos ligados por padrão. Ver
+      // PUSH_NOTIFICATION_TYPES pra lista completa e sendPushToFamily, que checa isso
+      // antes de mandar qualquer notificação.
+      pushPreferences: defaultPushPreferences()
     },
     // Status do dia corrente de cada tarefa do template acima — regenerado
     // automaticamente quando a data muda (ver ensureTasksForToday).
@@ -240,6 +261,16 @@ function backfillFamilyDefaults(family) {
   if (family.rules.resetUsageRequested === undefined) family.rules.resetUsageRequested = false;
   if (family.rules.emergencyPhone === undefined) family.rules.emergencyPhone = null;
   if (!Array.isArray(family.rules.pushTokens)) family.rules.pushTokens = [];
+  if (!family.rules.pushPreferences || typeof family.rules.pushPreferences !== 'object') {
+    family.rules.pushPreferences = defaultPushPreferences();
+  } else {
+    // Preenche só os tipos que ainda não existem (ex: tipo novo adicionado depois que
+    // essa família já tinha suas preferências salvas) — nunca sobrescreve escolha que
+    // o pai já fez.
+    PUSH_NOTIFICATION_TYPES.forEach(type => {
+      if (typeof family.rules.pushPreferences[type] !== 'boolean') family.rules.pushPreferences[type] = true;
+    });
+  }
   if (!family.timeRequests) family.timeRequests = [];
 }
 Object.values(db.families).forEach(backfillFamilyDefaults);
@@ -502,6 +533,9 @@ function getFamilyState(family) {
       // botão "Chamada de Emergência" da tela de bloqueio (tel: link).
       emergencyPhone: family.rules.emergencyPhone
     },
+    // Quais tipos de notificação push o pai quer receber (ver PUSH_NOTIFICATION_TYPES e
+    // parent:set_push_preferences) — tela de Notificações no app do Pai.
+    pushPreferences: family.rules.pushPreferences,
     blockedApps: family.rules.blockedApps.length > 0 ? family.rules.blockedApps : (primaryChild.installedApps || []),
     contentFilter: family.rules.contentFilter,
     location: primaryChild.location || {
@@ -1070,6 +1104,18 @@ io.on('connection', (socket) => {
       family.rules.pushTokens.push(token);
       saveDatabase(db);
     }
+  });
+
+  // Pai liga/desliga tipos de notificação push individualmente (tela de Notificações no
+  // app) — só aceita chaves conhecidas (PUSH_NOTIFICATION_TYPES), pra um nome digitado
+  // errado no cliente não criar uma chave solta que nunca é lida por sendPushToFamily.
+  socket.on('parent:set_push_preferences', ({ preferences } = {}) => {
+    if (!preferences || typeof preferences !== 'object') return;
+    PUSH_NOTIFICATION_TYPES.forEach(type => {
+      if (typeof preferences[type] === 'boolean') family.rules.pushPreferences[type] = preferences[type];
+    });
+    saveDatabase(db);
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   // Pai edita a lista de tarefas do dia e/ou o modo de bloqueio ('off' | 'earn' | 'all_or_nothing')
