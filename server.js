@@ -132,6 +132,10 @@ function defaultPushPreferences() {
   return Object.fromEntries(PUSH_NOTIFICATION_TYPES.map(type => [type, true]));
 }
 
+// Quantas entradas do histórico de apps abertos ficam guardadas por família — o
+// suficiente pra várias horas de uso real sem crescer o database.json sem limite.
+const MAX_APP_HISTORY_ENTRIES = 150;
+
 /**
  * Forma de uma família nova (recém-cadastrada) — mesmos campos que db.rules/etc tinham
  * na raiz antes do login existir, mas sem os dados de demonstração (sites/cercas de
@@ -189,7 +193,12 @@ function familyDefaults() {
       // Quais tipos de push o pai quer receber — todos ligados por padrão. Ver
       // PUSH_NOTIFICATION_TYPES pra lista completa e sendPushToFamily, que checa isso
       // antes de mandar qualquer notificação.
-      pushPreferences: defaultPushPreferences()
+      pushPreferences: defaultPushPreferences(),
+      // Histórico cronológico de apps abertos pela criança (mais recente por último) —
+      // ver POST /api/device/usage-history-sync. Capado em MAX_APP_HISTORY_ENTRIES pra
+      // não crescer sem limite; o app do Pai usa o último item pro resumo "acessou por
+      // último" na Home e a lista inteira na tela de Histórico.
+      appUsageHistory: []
     },
     // Status do dia corrente de cada tarefa do template acima — regenerado
     // automaticamente quando a data muda (ver ensureTasksForToday).
@@ -271,6 +280,7 @@ function backfillFamilyDefaults(family) {
       if (typeof family.rules.pushPreferences[type] !== 'boolean') family.rules.pushPreferences[type] = true;
     });
   }
+  if (!Array.isArray(family.rules.appUsageHistory)) family.rules.appUsageHistory = [];
   if (!family.timeRequests) family.timeRequests = [];
 }
 Object.values(db.families).forEach(backfillFamilyDefaults);
@@ -536,6 +546,9 @@ function getFamilyState(family) {
     // Quais tipos de notificação push o pai quer receber (ver PUSH_NOTIFICATION_TYPES e
     // parent:set_push_preferences) — tela de Notificações no app do Pai.
     pushPreferences: family.rules.pushPreferences,
+    // Mais recente primeiro — o app do Pai usa o item [0] pro resumo da Home e a lista
+    // inteira na tela de Histórico.
+    appUsageHistory: [...family.rules.appUsageHistory].reverse(),
     blockedApps: family.rules.blockedApps.length > 0 ? family.rules.blockedApps : (primaryChild.installedApps || []),
     contentFilter: family.rules.contentFilter,
     location: primaryChild.location || {
@@ -713,6 +726,37 @@ app.post('/api/device/telemetry-sync', (req, res) => {
   family.rules.deviceSyncRequested = false;
   dev.lastSeen = new Date().toISOString();
   dev.isOnline = true;
+  saveDatabase(db);
+  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  res.json({ success: true });
+});
+
+// Enviado periodicamente pelo ParentalAccessibilityService com os apps abertos desde o
+// último sync — { history: [{ package, name, timestamp }, ...] } — cada entrada é um app
+// que ENTROU em primeiro plano de verdade (não cada evento de acessibilidade). O cliente
+// manda sua lista local inteira (já capada lá) a cada ciclo; o servidor funde com o que
+// já tinha (por timestamp, evita duplicar se o mesmo ciclo for reenviado) e capa nas
+// últimas MAX_APP_HISTORY_ENTRIES.
+app.post('/api/device/usage-history-sync', (req, res) => {
+  const { history } = req.body || {};
+  const { family, familyId } = resolveDeviceFamily(req);
+  if (!Array.isArray(history) || history.length === 0) {
+    return res.json({ success: true });
+  }
+
+  const existingTimestamps = new Set(family.rules.appUsageHistory.map(h => h.timestamp));
+  const newEntries = history
+    .filter(h => h && h.package && typeof h.timestamp === 'number' && !existingTimestamps.has(h.timestamp))
+    .map(h => ({ package: String(h.package), name: String(h.name || h.package), timestamp: h.timestamp }));
+
+  if (newEntries.length === 0) {
+    return res.json({ success: true });
+  }
+
+  family.rules.appUsageHistory = [...family.rules.appUsageHistory, ...newEntries]
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .slice(-MAX_APP_HISTORY_ENTRIES);
+
   saveDatabase(db);
   io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   res.json({ success: true });
