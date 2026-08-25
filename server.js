@@ -163,6 +163,13 @@ function familyDefaults() {
       // travado até todas as tarefas de hoje serem aprovadas.
       taskUnlockMode: 'off',
       dailyTasks: [], // template: [{ id, title, icon, rewardMinutes }]
+      // Timestamp (epoch ms) até quando o PAI liberou o aparelho manualmente, mesmo sem
+      // tarefa concluída — ver parent:grant_bonus_time. null = nenhuma liberação ativa.
+      // Suspende especificamente o gate de tarefa ('all_or_nothing') e o limite diário
+      // esgotado (ver isTaskGateBlocking/isDailyLimitExceeded em GuardianPrefs.kt), NÃO
+      // Pausa Geral nem horário agendado — essas continuam bloqueando mesmo com uma
+      // liberação de tempo pendente (só o PIN de emergência suspende tudo).
+      parentTimeGrantUntil: null,
       // PIN de emergência: só o hash SHA-256 é guardado, nunca o valor em texto puro
       // (ver parent:set_unlock_pin) — o nativo sincroniza o hash e faz a checagem
       // 100% offline no aparelho da criança (ver ParentalAccessibilityService.kt).
@@ -269,6 +276,7 @@ function backfillFamilyDefaults(family) {
   if (family.rules.deviceSyncRequested === undefined) family.rules.deviceSyncRequested = false;
   if (family.rules.resetUsageRequested === undefined) family.rules.resetUsageRequested = false;
   if (family.rules.emergencyPhone === undefined) family.rules.emergencyPhone = null;
+  if (family.rules.parentTimeGrantUntil === undefined) family.rules.parentTimeGrantUntil = null;
   if (!Array.isArray(family.rules.pushTokens)) family.rules.pushTokens = [];
   if (!family.rules.pushPreferences || typeof family.rules.pushPreferences !== 'object') {
     family.rules.pushPreferences = defaultPushPreferences();
@@ -569,7 +577,10 @@ function getFamilyState(family) {
     tasks: {
       unlockMode: family.rules.taskUnlockMode,
       dailyTasks: family.rules.dailyTasks,
-      todayStatus: family.taskInstances.items
+      todayStatus: family.taskInstances.items,
+      // Ver parent:grant_bonus_time — o app do Pai usa isto só pra mostrar "liberado até
+      // HH:mm" (ex: bloco de tarefas); quem de fato aplica a suspensão é o nativo do Filho.
+      parentTimeGrantUntil: family.rules.parentTimeGrantUntil
     }
   };
 }
@@ -618,6 +629,9 @@ app.get('/api/tasks/sync', (req, res) => {
     dailyLimitMinutes: computeEffectiveDailyLimitMinutes(family),
     dailyTasks: family.rules.dailyTasks,
     todayStatus: family.taskInstances.items,
+    // Ver parent:grant_bonus_time — 0/ausente = nenhuma liberação manual ativa. O nativo
+    // grava isto e passa a ignorar o gate de tarefa + tempo esgotado até esse instante.
+    parentTimeGrantUntil: family.rules.parentTimeGrantUntil,
     isPauseAllActive: family.rules.isPauseAllActive,
     blockedPackages: family.rules.blockedApps.filter(a => a.isBlocked).map(a => a.id),
     // Apps que o pai marcou como "sempre disponível" — o nativo libera esses pacotes
@@ -1116,6 +1130,32 @@ io.on('connection', (socket) => {
       io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
       io.to(familyRoom(familyId)).emit('notification:request_answered', { request: reqItem, approved, bonusMinutes });
     }
+  });
+
+  // Pai libera uma quantidade de tempo ESCOLHIDA NA HORA, sem precisar de um pedido
+  // prévio da criança nem de tarefa nenhuma concluída — pedido explícito do usuário:
+  // "mesmo no modo Tudo ou Nada, ainda quero poder liberar o tempo que eu quiser". Ao
+  // contrário de parent:respond_time_request (que só soma minutos e por isso não tinha
+  // efeito nenhum no modo 'all_or_nothing', já que lá o bloqueio é por tarefa pendente,
+  // não por minuto — ver diagnóstico registrado na sessão), isto grava até QUANDO a
+  // liberação vale (parentTimeGrantUntil) — é esse timestamp que o nativo do Filho usa
+  // pra suspender temporariamente tanto o gate de tarefa quanto o limite diário esgotado
+  // (ver isTaskGateBlocking/isDailyLimitExceeded em GuardianPrefs.kt), em QUALQUER modo.
+  socket.on('parent:grant_bonus_time', ({ minutes }) => {
+    const mins = Number(minutes);
+    if (!mins || mins <= 0) return;
+    family.rules.dailyLimitMinutes += mins; // ainda útil nos modos 'off'/'earn' — ver computeEffectiveDailyLimitMinutes
+    family.rules.parentTimeGrantUntil = Date.now() + mins * 60 * 1000;
+    saveDatabase(db);
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  });
+
+  // Cancela uma liberação manual em andamento antes da hora (ex: pai clicou errado, ou
+  // decidiu voltar atrás) — ver parent:grant_bonus_time.
+  socket.on('parent:revoke_bonus_time', () => {
+    family.rules.parentTimeGrantUntil = null;
+    saveDatabase(db);
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
 
   socket.on('child:request_extra_time', ({ reason, requestedMinutes }) => {
