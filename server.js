@@ -170,6 +170,18 @@ function familyDefaults() {
       // Pausa Geral nem horário agendado — essas continuam bloqueando mesmo com uma
       // liberação de tempo pendente (só o PIN de emergência suspende tudo).
       parentTimeGrantUntil: null,
+      // "clock" (tempo corrido, padrão/antigo) ou "usage" (tempo de uso: só escoa
+      // enquanto a tela do Filho está ligada de verdade — ver parent:grant_bonus_time
+      // e GuardianPrefs.parentTimeGrantMode no nativo).
+      parentTimeGrantMode: 'clock',
+      // Total concedido em modo "usage" — usado junto com parentTimeGrantUsageMinutesUsed
+      // (que o nativo reporta em POST /api/device/telemetry-sync) só pro app do Pai exibir
+      // "usou Ymin de Xmin"; quem decide o bloqueio é o próprio nativo, 100% local.
+      parentTimeGrantUsageMinutesTotal: 0,
+      parentTimeGrantUsageMinutesUsed: 0,
+      // Identifica CADA concessão (Date.now() no momento de conceder) — o nativo usa isto
+      // pra saber que é uma liberação NOVA e zerar o progresso local da anterior.
+      parentTimeGrantId: null,
       // PIN de emergência: só o hash SHA-256 é guardado, nunca o valor em texto puro
       // (ver parent:set_unlock_pin) — o nativo sincroniza o hash e faz a checagem
       // 100% offline no aparelho da criança (ver ParentalAccessibilityService.kt).
@@ -277,6 +289,10 @@ function backfillFamilyDefaults(family) {
   if (family.rules.resetUsageRequested === undefined) family.rules.resetUsageRequested = false;
   if (family.rules.emergencyPhone === undefined) family.rules.emergencyPhone = null;
   if (family.rules.parentTimeGrantUntil === undefined) family.rules.parentTimeGrantUntil = null;
+  if (family.rules.parentTimeGrantMode === undefined) family.rules.parentTimeGrantMode = 'clock';
+  if (family.rules.parentTimeGrantUsageMinutesTotal === undefined) family.rules.parentTimeGrantUsageMinutesTotal = 0;
+  if (family.rules.parentTimeGrantUsageMinutesUsed === undefined) family.rules.parentTimeGrantUsageMinutesUsed = 0;
+  if (family.rules.parentTimeGrantId === undefined) family.rules.parentTimeGrantId = null;
   if (!Array.isArray(family.rules.pushTokens)) family.rules.pushTokens = [];
   if (!family.rules.pushPreferences || typeof family.rules.pushPreferences !== 'object') {
     family.rules.pushPreferences = defaultPushPreferences();
@@ -580,7 +596,12 @@ function getFamilyState(family) {
       todayStatus: family.taskInstances.items,
       // Ver parent:grant_bonus_time — o app do Pai usa isto só pra mostrar "liberado até
       // HH:mm" (ex: bloco de tarefas); quem de fato aplica a suspensão é o nativo do Filho.
-      parentTimeGrantUntil: family.rules.parentTimeGrantUntil
+      parentTimeGrantUntil: family.rules.parentTimeGrantUntil,
+      // "clock" ou "usage" — junto com o total/usado, dá pro app do Pai mostrar "liberado
+      // por Xmin de uso (usou Ymin)" em vez de "até HH:mm" quando o modo for "usage".
+      parentTimeGrantMode: family.rules.parentTimeGrantMode,
+      parentTimeGrantUsageMinutesTotal: family.rules.parentTimeGrantUsageMinutesTotal,
+      parentTimeGrantUsageMinutesUsed: family.rules.parentTimeGrantUsageMinutesUsed
     }
   };
 }
@@ -630,8 +651,13 @@ app.get('/api/tasks/sync', (req, res) => {
     dailyTasks: family.rules.dailyTasks,
     todayStatus: family.taskInstances.items,
     // Ver parent:grant_bonus_time — 0/ausente = nenhuma liberação manual ativa. O nativo
-    // grava isto e passa a ignorar o gate de tarefa + tempo esgotado até esse instante.
+    // grava isto e passa a ignorar o gate de tarefa + tempo esgotado até esse instante
+    // (modo "clock") ou até consumir o total de minutos de uso (modo "usage" — ver
+    // GuardianPrefs.isParentTimeGrantActive no nativo).
     parentTimeGrantUntil: family.rules.parentTimeGrantUntil,
+    parentTimeGrantMode: family.rules.parentTimeGrantMode,
+    parentTimeGrantUsageMinutesTotal: family.rules.parentTimeGrantUsageMinutesTotal,
+    parentTimeGrantId: family.rules.parentTimeGrantId,
     isPauseAllActive: family.rules.isPauseAllActive,
     blockedPackages: family.rules.blockedApps.filter(a => a.isBlocked).map(a => a.id),
     // Apps que o pai marcou como "sempre disponível" — o nativo libera esses pacotes
@@ -721,7 +747,7 @@ function checkGeofenceCrossings(family, location) {
 // deviceSyncRequested acima). Antes esses 3 campos só chegavam via 'child:telemetry'
 // (WebView), que quase nunca abre no uso normal — ficavam desatualizados por dias.
 app.post('/api/device/telemetry-sync', (req, res) => {
-  const { batteryLevel, networkType, deviceModel, usedMinutesToday } = req.body || {};
+  const { batteryLevel, networkType, deviceModel, usedMinutesToday, parentTimeGrantId, parentTimeGrantUsageMinutesUsed } = req.body || {};
   const { family, familyId } = resolveDeviceFamily(req);
   const dev = Object.values(family.pairedDevices)[0];
   if (!dev) {
@@ -736,6 +762,19 @@ app.post('/api/device/telemetry-sync', (req, res) => {
   // inteiro (só corrigia se o dia virasse e o contador local zerasse sozinho).
   if (typeof usedMinutesToday === 'number' && usedMinutesToday >= 0) {
     dev.usedMinutesToday = usedMinutesToday;
+  }
+  // Progresso da liberação "tempo de uso" — só aceita se ainda for a MESMA concessão
+  // (parentTimeGrantId bate com o que está salvo agora); um device que ainda não pegou
+  // a liberação mais nova (ou está reportando a antiga, já revogada) não pode sobrescrever
+  // o progresso de uma concessão diferente. Só afeta o número exibido pro pai — o bloqueio
+  // em si já foi decidido 100% local no nativo antes deste POST sair.
+  if (
+    typeof parentTimeGrantUsageMinutesUsed === 'number' &&
+    parentTimeGrantUsageMinutesUsed >= 0 &&
+    family.rules.parentTimeGrantMode === 'usage' &&
+    parentTimeGrantId === family.rules.parentTimeGrantId
+  ) {
+    family.rules.parentTimeGrantUsageMinutesUsed = parentTimeGrantUsageMinutesUsed;
   }
   family.rules.deviceSyncRequested = false;
   dev.lastSeen = new Date().toISOString();
@@ -1138,14 +1177,29 @@ io.on('connection', (socket) => {
   // contrário de parent:respond_time_request (que só soma minutos e por isso não tinha
   // efeito nenhum no modo 'all_or_nothing', já que lá o bloqueio é por tarefa pendente,
   // não por minuto — ver diagnóstico registrado na sessão), isto grava até QUANDO a
-  // liberação vale (parentTimeGrantUntil) — é esse timestamp que o nativo do Filho usa
-  // pra suspender temporariamente tanto o gate de tarefa quanto o limite diário esgotado
-  // (ver isTaskGateBlocking/isDailyLimitExceeded em GuardianPrefs.kt), em QUALQUER modo.
-  socket.on('parent:grant_bonus_time', ({ minutes }) => {
+  // liberação vale — é isso que o nativo do Filho usa pra suspender temporariamente
+  // tanto o gate de tarefa quanto o limite diário esgotado (ver isTaskGateBlocking/
+  // isDailyLimitExceeded em GuardianPrefs.kt), em QUALQUER modo de tarefa.
+  //
+  // `mode` escolhe COMO os minutos escoam (pedido explícito do usuário: "eu queria a
+  // opção de marcar como tempo de uso"):
+  // - 'clock' (padrão/antigo, "tempo corrido"): expira num horário fixo (parentTimeGrantUntil),
+  //   contando mesmo que a criança não toque no aparelho nesse meio tempo.
+  // - 'usage' ("tempo de uso"): só conta enquanto a tela do Filho está ligada de verdade —
+  //   o nativo decrementa localmente (ver GuardianPrefs.incrementParentTimeGrantUsageMinuteIfActive),
+  //   então o backend não tem "até quando" fixo, só o total concedido.
+  socket.on('parent:grant_bonus_time', ({ minutes, mode }) => {
     const mins = Number(minutes);
     if (!mins || mins <= 0) return;
+    const isUsageMode = mode === 'usage';
     family.rules.dailyLimitMinutes += mins; // ainda útil nos modos 'off'/'earn' — ver computeEffectiveDailyLimitMinutes
-    family.rules.parentTimeGrantUntil = Date.now() + mins * 60 * 1000;
+    family.rules.parentTimeGrantMode = isUsageMode ? 'usage' : 'clock';
+    family.rules.parentTimeGrantUntil = isUsageMode ? null : Date.now() + mins * 60 * 1000;
+    family.rules.parentTimeGrantUsageMinutesTotal = isUsageMode ? mins : 0;
+    family.rules.parentTimeGrantUsageMinutesUsed = 0;
+    // Novo ID a cada concessão — é assim que o nativo percebe "essa é uma liberação NOVA"
+    // e zera o progresso local da anterior (ver GuardianPrefs.saveRulesSync).
+    family.rules.parentTimeGrantId = Date.now();
     saveDatabase(db);
     io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
@@ -1154,6 +1208,10 @@ io.on('connection', (socket) => {
   // decidiu voltar atrás) — ver parent:grant_bonus_time.
   socket.on('parent:revoke_bonus_time', () => {
     family.rules.parentTimeGrantUntil = null;
+    family.rules.parentTimeGrantMode = 'clock';
+    family.rules.parentTimeGrantUsageMinutesTotal = 0;
+    family.rules.parentTimeGrantUsageMinutesUsed = 0;
+    family.rules.parentTimeGrantId = null;
     saveDatabase(db);
     io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
   });
