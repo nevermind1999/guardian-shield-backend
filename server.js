@@ -696,6 +696,34 @@ app.post('/api/device/reset-usage-ack', (req, res) => {
   res.json({ success: true });
 });
 
+// Pedido de tempo extra vindo do lado NATIVO (botão na tela de bloqueio, ver
+// LockOverlayService.kt) — espelha o handler de socket 'child:request_extra_time' (usado
+// pela WebView), só que por HTTP simples: a tela de bloqueio roda inteiramente no nativo,
+// sem cliente socket.io (mesmo motivo documentado em /api/tasks/sync acima — o nativo
+// fica sempre vivo, a WebView quase nunca abre no uso normal).
+app.post('/api/device/request-extra-time', (req, res) => {
+  const { reason, requestedMinutes } = req.body || {};
+  const { family, familyId } = resolveDeviceFamily(req);
+  if (!family.timeRequests) family.timeRequests = [];
+  const newRequest = {
+    id: 'req-' + Date.now(),
+    timestamp: new Date().toISOString(),
+    reason: (reason && String(reason).trim()) || 'Preciso para uso pessoal',
+    requestedMinutes: Number.isFinite(requestedMinutes) && requestedMinutes > 0 ? Math.round(requestedMinutes) : 15,
+    status: 'pending'
+  };
+  family.timeRequests.unshift(newRequest);
+  saveDatabase(db);
+  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  io.to(familyRoom(familyId)).emit('notification:new_time_request', newRequest);
+  sendPushToFamily(family, {
+    title: '⏱️ Pedido de tempo extra',
+    body: `+${newRequest.requestedMinutes} min — "${newRequest.reason}"`,
+    data: { type: 'time_request', requestId: newRequest.id }
+  });
+  res.json({ success: true, requestId: newRequest.id });
+});
+
 // Chamado pelo nativo assim que consegue uma localização fresca (a cada tick normal,
 // ou logo depois de um pedido de atualização forçada — ver locationUpdateRequested
 // acima). Espelha reconcileInstalledApps, mas pra posição.
