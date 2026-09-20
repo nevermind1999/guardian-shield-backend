@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "3001:3001"
+    restart: always
+    volumes:
+      - ./backend/database.json:/app/database.json
+    environment:
+      - PORT=3001
