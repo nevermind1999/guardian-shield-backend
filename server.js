@@ -537,6 +537,12 @@ function completePairing(code, deviceInfo) {
   if (!family) return { success: false, message: 'Código de pareamento inválido ou expirado.' };
 
   const deviceId = deviceInfo?.id || 'child-' + Date.now();
+  // O resto do sistema usa o PRIMEIRO aparelho da família (Object.values(...)[0]) — o
+  // pareado agora vira o primeiro. Sem isso, reinstalar o app do filho (que no Android 8+
+  // ganha outro ANDROID_ID se a assinatura mudar) deixava o aparelho novo "escondido" atrás
+  // do registro antigo, e o pai continuava vendo o celular velho.
+  const { [deviceId]: _replaced, ...otherDevices } = family.pairedDevices;
+  family.pairedDevices = { [deviceId]: null, ...otherDevices };
   family.pairedDevices[deviceId] = {
     id: deviceId,
     name: deviceInfo?.name || 'Dispositivo do Filho',
