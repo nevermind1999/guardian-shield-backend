@@ -10,8 +10,10 @@
  */
 const admin = require('firebase-admin');
 const { getMessaging } = require('firebase-admin/messaging');
+const { getAuth } = require('firebase-admin/auth');
 
 let initialized = false;
+let authApp = null;
 
 function initFirebase() {
   if (initialized) return;
@@ -85,4 +87,17 @@ async function sendPushToFamily(family, { title, body, data } = {}) {
   }
 }
 
-module.exports = { initFirebase, sendPushToFamily };
+/**
+ * Confere um ID token do Firebase Auth (login com Google no app do pai). Só precisa do id
+ * do projeto — as chaves públicas vêm do Google — então funciona mesmo sem
+ * FIREBASE_SERVICE_ACCOUNT. Usa um app separado pra não depender do push estar ligado.
+ */
+function verifyFirebaseIdToken(idToken) {
+  if (!authApp) {
+    const projectId = process.env.FIREBASE_PROJECT_ID || 'guardianshield-54d39';
+    authApp = admin.initializeApp({ projectId }, 'auth');
+  }
+  return getAuth(authApp).verifyIdToken(idToken);
+}
+
+module.exports = { initFirebase, sendPushToFamily, verifyFirebaseIdToken };

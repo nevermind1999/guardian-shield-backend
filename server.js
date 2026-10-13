@@ -13,7 +13,7 @@ const path = require('path');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { initFirebase, sendPushToFamily } = require('./push');
+const { initFirebase, sendPushToFamily, verifyFirebaseIdToken } = require('./push');
 
 initFirebase();
 
@@ -444,10 +444,22 @@ function wakeSyncWaiters(familyId) {
 }
 
 // ============================== ENDPOINTS DE CONTA ==============================
-// Só o app do Pai loga (email+senha por enquanto). "googleId" já existe no usuário desde
-// já (sempre null) — quando o login com Google for ligado, um POST /api/auth/google novo
-// só precisa achar-ou-criar o usuário por email/googleId e devolver o mesmo formato de
-// token dos dois endpoints abaixo; nenhuma peça do resto do app precisa mudar de novo.
+// Só o app do Pai loga: email+senha ou Google (POST /api/auth/google). Os três devolvem o
+// mesmo token, então o resto do app não sabe por onde a pessoa entrou.
+
+function createUser({ email, passwordHash, googleId }) {
+  const isFirstAccountEver = Object.keys(db.users).length === 0;
+  const userId = 'user-' + Date.now();
+  // A 1ª conta cadastrada no backend herda a família legada (o pareamento real que já
+  // existia antes de contas existirem) — as seguintes criam famílias vazias normalmente.
+  const familyId = (isFirstAccountEver && db.families[LEGACY_FAMILY_ID]) ? LEGACY_FAMILY_ID : userId;
+  if (!db.families[familyId]) db.families[familyId] = familyDefaults();
+
+  const user = { id: userId, email, passwordHash, googleId, familyId, createdAt: new Date().toISOString() };
+  db.users[userId] = user;
+  saveDatabase();
+  return user;
+}
 
 app.post('/api/auth/register', async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
@@ -462,29 +474,58 @@ app.post('/api/auth/register', async (req, res) => {
     return res.status(409).json({ success: false, message: 'Já existe uma conta com esse email.' });
   }
 
-  const isFirstAccountEver = Object.keys(db.users).length === 0;
-  const userId = 'user-' + Date.now();
-  // A 1ª conta cadastrada no backend herda a família legada (o pareamento real que já
-  // existia antes de contas existirem) — as seguintes criam famílias vazias normalmente.
-  const familyId = (isFirstAccountEver && db.families[LEGACY_FAMILY_ID]) ? LEGACY_FAMILY_ID : userId;
-  if (!db.families[familyId]) db.families[familyId] = familyDefaults();
-
   const passwordHash = await bcrypt.hash(password, 10);
-  const user = { id: userId, email, passwordHash, googleId: null, familyId, createdAt: new Date().toISOString() };
-  db.users[userId] = user;
-  saveDatabase();
-
-  res.json({ success: true, token: signUserToken(user) });
+  const user = createUser({ email, passwordHash, googleId: null });
+  res.json({ success: true, token: signUserToken(user), email: user.email });
 });
 
 app.post('/api/auth/login', async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
   const user = Object.values(db.users).find(u => u.email === email);
-  if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
-    return res.status(401).json({ success: false, message: 'Email ou senha incorretos.' });
+  if (!user || !user.passwordHash || !(await bcrypt.compare(password, user.passwordHash))) {
+    // Conta criada pelo Google não tem senha — avisa em vez de só dizer "senha errada".
+    const message = user && !user.passwordHash
+      ? 'Essa conta entra com o Google. Use "Continuar com Google".'
+      : 'Email ou senha incorretos.';
+    return res.status(401).json({ success: false, message });
   }
-  res.json({ success: true, token: signUserToken(user) });
+  res.json({ success: true, token: signUserToken(user), email: user.email });
+});
+
+/** Login com Google. O app entra pelo Firebase Auth (provedor Google) e manda o ID token
+ * do Firebase; aqui ele é conferido (assinatura, projeto, validade) e a conta é achada
+ * pelo googleId, ou pelo email (liga uma conta de email+senha já existente ao Google), ou
+ * criada na hora. Devolve o mesmo token dos endpoints acima. */
+app.post('/api/auth/google', async (req, res) => {
+  const idToken = String(req.body?.idToken || '');
+  if (!idToken) return res.status(400).json({ success: false, message: 'Token do Google ausente.' });
+
+  let decoded;
+  try {
+    decoded = await verifyFirebaseIdToken(idToken);
+  } catch (e) {
+    console.warn('Login Google recusado:', e.code || e.message);
+    return res.status(401).json({ success: false, message: 'Não foi possível confirmar sua conta Google. Tente de novo.' });
+  }
+
+  const googleId = decoded.firebase?.identities?.['google.com']?.[0];
+  const email = String(decoded.email || '').trim().toLowerCase();
+  if (decoded.firebase?.sign_in_provider !== 'google.com' || !googleId || !email || decoded.email_verified !== true) {
+    return res.status(401).json({ success: false, message: 'Conta Google sem e-mail confirmado.' });
+  }
+
+  let user = Object.values(db.users).find(u => u.googleId === googleId)
+    || Object.values(db.users).find(u => u.email === email);
+  if (user) {
+    if (user.googleId !== googleId) {
+      user.googleId = googleId;
+      saveDatabase();
+    }
+  } else {
+    user = createUser({ email, passwordHash: null, googleId });
+  }
+  res.json({ success: true, token: signUserToken(user), email: user.email });
 });
 
 /** Usado no boot dos apps do Pai pra decidir se mostra o popup de login/cadastro
