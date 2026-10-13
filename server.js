@@ -776,6 +776,21 @@ function getFamilyState(family) {
 // atualizado funcionando exatamente como hoje enquanto o rollout não estiver completo
 // nos 3 apps (ver plano de migração).
 
+/** Aparelho com token válido mas que não está mais na família (o pai despareou pelo app)
+ * recebe 401 { unpaired: true } em qualquer rota — o app do filho esquece o pareamento e
+ * tira os bloqueios. Sem token (app antigo) segue no fluxo de sempre. */
+app.use('/api', (req, res, next) => {
+  const token = req.headers['x-device-token'] || req.query.deviceToken;
+  if (!token) return next();
+  const payload = verifyToken(token);
+  if (payload?.type !== 'device') return next();
+  const family = db.families[payload.familyId];
+  if (!family || !family.pairedDevices[payload.deviceId]) {
+    return res.status(401).json({ success: false, unpaired: true, message: 'Este aparelho foi desconectado da conta dos pais.' });
+  }
+  next();
+});
+
 /** Resolve a família de uma chamada do dispositivo — nunca falha (cai na família
  * legada sem token), pra não quebrar o app do Filho ainda não atualizado. */
 function resolveDeviceFamily(req) {
@@ -1336,6 +1351,22 @@ io.on('connection', (socket) => {
       saveDatabase();
       broadcastState(familyId);
     }
+  });
+
+  // Desparear: tira o aparelho da família. O token dele deixa de valer na hora (ver o
+  // middleware de /api acima); o long-poll aberto é acordado pra ele descobrir rápido.
+  // Pra voltar, só pareando de novo com um código novo.
+  socket.on('parent:unpair_device', ({ deviceId } = {}) => {
+    if (!deviceId || !family.pairedDevices[deviceId]) {
+      socket.emit('parent:unpair_result', { success: false, message: 'Aparelho não encontrado.' });
+      return;
+    }
+    delete family.pairedDevices[deviceId];
+    saveDatabase();
+    broadcastState(familyId);
+    [...(syncWaiters.get(familyId) || [])].forEach(w => w.finish());
+    socket.emit('parent:unpair_result', { success: true, deviceId });
+    console.log(`🔌 Aparelho ${deviceId} despareado (família: ${familyId})`);
   });
 
   // "Zerar tempo usado hoje" — pro pai corrigir depois de usar o tempo da criança
