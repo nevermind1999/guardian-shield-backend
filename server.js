@@ -115,6 +115,28 @@ function familyRoom(familyId) {
 
 const DB_FILE = path.join(__dirname, 'database.json');
 
+// Horários de Dormir/Estudo, a virada do dia das tarefas e o lembrete das 20h são no
+// horário da família, não do servidor — a VPS roda em UTC, então antes o "22:00" de dormir
+// valia às 19:00 de Brasília e as tarefas zeravam às 21:00.
+const APP_TIMEZONE = process.env.APP_TIMEZONE || 'America/Sao_Paulo';
+const localClockFormat = new Intl.DateTimeFormat('en-CA', {
+  timeZone: APP_TIMEZONE,
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+});
+
+/** { date: 'yyyy-mm-dd', hours, minutes } no fuso APP_TIMEZONE. */
+function localNow() {
+  const parts = Object.fromEntries(localClockFormat.formatToParts(new Date()).map(p => [p.type, p.value]));
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, hours: Number(parts.hour), minutes: Number(parts.minute) };
+}
+
+// Aparelho conta como online se mandou qualquer coisa nos últimos minutos (o nativo
+// reporta localização/histórico a cada ~1min). Antes isOnline virava true e nunca mais
+// voltava pra false — o app do pai mostrava "Online" com o celular desligado há dias.
+const DEVICE_ONLINE_WINDOW_MS = 3 * 60 * 1000;
+const MAX_TIME_REQUESTS = 50;
+
 // Todo tipo de push que o servidor sabe mandar (o "type" que já vai em data.type em cada
 // chamada de sendPushToFamily) — fonte única usada tanto pro default de pushPreferences
 // quanto pra validar o que o app do Pai manda em parent:set_push_preferences, pra uma
@@ -265,13 +287,56 @@ function loadDatabase() {
   return { users: {}, activePairingCodes: {}, families: {} };
 }
 
-function saveDatabase(db) {
+// Gravação agrupada e fora da thread principal: antes cada evento (telemetria, GPS,
+// histórico de apps — vários por minuto por aparelho) fazia um writeFileSync do banco
+// inteiro formatado, travando o servidor durante a escrita. Agora várias mudanças em
+// sequência viram uma gravação só (SAVE_DEBOUNCE_MS depois da primeira), escrita num
+// arquivo temporário e renomeada por cima (nunca deixa um database.json pela metade se o
+// processo cair no meio). flushDatabaseSync() garante a última gravação ao desligar.
+const SAVE_DEBOUNCE_MS = 400;
+let saveTimer = null;
+let saveInProgress = false;
+let saveRequestedDuringWrite = false;
+
+function saveDatabase() {
+  if (saveInProgress) { saveRequestedDuringWrite = true; return; }
+  if (!saveTimer) saveTimer = setTimeout(writeDatabaseAsync, SAVE_DEBOUNCE_MS);
+}
+
+function writeDatabaseAsync() {
+  saveTimer = null;
+  saveInProgress = true;
+  const tmpFile = DB_FILE + '.tmp';
+  const done = (err) => {
+    if (err) console.error('Erro ao salvar banco de dados:', err);
+    saveInProgress = false;
+    if (saveRequestedDuringWrite) { saveRequestedDuringWrite = false; saveDatabase(); }
+  };
+  let data;
+  try { data = JSON.stringify(db); } catch (e) { return done(e); }
+  fs.writeFile(tmpFile, data, (err) => {
+    if (err) return done(err);
+    fs.rename(tmpFile, DB_FILE, (renameErr) => {
+      // Bind mount de arquivo único (docker-compose) não aceita rename por cima — grava direto.
+      if (renameErr) return fs.writeFile(DB_FILE, data, done);
+      done();
+    });
+  });
+}
+
+function flushDatabaseSync() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+    fs.writeFileSync(DB_FILE, JSON.stringify(db));
   } catch (e) {
     console.error('Erro ao salvar banco de dados:', e);
   }
 }
+
+['SIGINT', 'SIGTERM'].forEach(signal => process.on(signal, () => {
+  flushDatabaseSync();
+  process.exit(0);
+}));
 
 let db = loadDatabase();
 
@@ -320,8 +385,10 @@ function blankTaskItem(taskId) {
  * padrão de day-rollover usado no contador de tempo de tela do app da criança.
  */
 function ensureTasksForToday(family) {
-  const today = new Date().toISOString().slice(0, 10); // yyyy-mm-dd
-  if (family.taskInstances.date === today) return;
+  const today = localNow().date;
+  // ">=" e não "===": dias gravados em UTC por versões antigas podem estar 1 dia à frente
+  // do dia local (entre 21h e meia-noite) — não zera o progresso por causa disso.
+  if (family.taskInstances.date && family.taskInstances.date >= today) return;
   family.taskInstances = {
     date: today,
     items: family.rules.dailyTasks.map(task => blankTaskItem(task.id))
@@ -343,6 +410,38 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
+
+// ============================== AVISOS DE MUDANÇA ==============================
+// Antes, cada mudança mandava na hora o estado INTEIRO da família pro app do pai (com
+// histórico, lista de apps etc) — uma rajada de eventos do aparelho (GPS + histórico +
+// telemetria chegando juntos) virava várias cópias seguidas do mesmo estado. Agora as
+// mudanças de uma família dentro de STATE_BROADCAST_DELAY_MS viram um envio só.
+//
+// O mesmo aviso acorda o long-poll do aparelho do filho (GET /api/tasks/sync?wait=...),
+// pra uma regra mudada pelo pai chegar no celular em ~1s em vez de esperar o próximo poll.
+const STATE_BROADCAST_DELAY_MS = 150;
+const pendingBroadcasts = new Map(); // familyId -> timeout
+const syncWaiters = new Map(); // familyId -> Set<{ version, finish }>
+
+function broadcastState(familyId) {
+  if (pendingBroadcasts.has(familyId)) return;
+  pendingBroadcasts.set(familyId, setTimeout(() => {
+    pendingBroadcasts.delete(familyId);
+    const family = db.families[familyId];
+    if (!family) return;
+    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    wakeSyncWaiters(familyId);
+  }, STATE_BROADCAST_DELAY_MS));
+}
+
+function wakeSyncWaiters(familyId) {
+  const waiters = syncWaiters.get(familyId);
+  if (!waiters || waiters.size === 0) return;
+  const family = db.families[familyId];
+  if (!family) return;
+  const { version } = buildDeviceSync(family);
+  [...waiters].forEach(w => { if (w.version !== version) w.finish(); });
+}
 
 // ============================== ENDPOINTS DE CONTA ==============================
 // Só o app do Pai loga (email+senha por enquanto). "googleId" já existe no usuário desde
@@ -373,7 +472,7 @@ app.post('/api/auth/register', async (req, res) => {
   const passwordHash = await bcrypt.hash(password, 10);
   const user = { id: userId, email, passwordHash, googleId: null, familyId, createdAt: new Date().toISOString() };
   db.users[userId] = user;
-  saveDatabase(db);
+  saveDatabase();
 
   res.json({ success: true, token: signUserToken(user) });
 });
@@ -417,7 +516,7 @@ app.post('/api/pair/generate', (req, res) => {
     createdAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString() // expira em 15min
   };
-  saveDatabase(db);
+  saveDatabase();
 
   res.json({
     success: true,
@@ -450,10 +549,10 @@ function completePairing(code, deviceInfo) {
   };
 
   delete db.activePairingCodes[code];
-  saveDatabase(db);
+  saveDatabase();
 
   io.to(familyRoom(pairingData.familyId)).emit('device:paired', family.pairedDevices[deviceId]);
-  io.to(familyRoom(pairingData.familyId)).emit('state:update', getFamilyState(family));
+  broadcastState(pairingData.familyId);
 
   return {
     success: true,
@@ -514,8 +613,8 @@ function isWithinSchedule(schedule) {
   const startMinutes = startH * 60 + startM;
   const endMinutes = endH * 60 + endM;
   if (startMinutes === endMinutes) return false; // intervalo de 0min, nunca bloqueia
-  const now = new Date();
-  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  const now = localNow();
+  const nowMinutes = now.hours * 60 + now.minutes;
   return startMinutes < endMinutes
     ? (nowMinutes >= startMinutes && nowMinutes < endMinutes)
     : (nowMinutes >= startMinutes || nowMinutes < endMinutes);
@@ -537,9 +636,14 @@ function activeScheduleBlock(family) {
   return null;
 }
 
+function withComputedOnline(dev) {
+  const lastSeenMs = Date.parse(dev.lastSeen || '') || 0;
+  return { ...dev, isOnline: Date.now() - lastSeenMs < DEVICE_ONLINE_WINDOW_MS };
+}
+
 function getFamilyState(family) {
   ensureTasksForToday(family);
-  const devicesList = Object.values(family.pairedDevices);
+  const devicesList = Object.values(family.pairedDevices).map(withComputedOnline);
   const primaryChild = devicesList[0] || {
     id: 'demo-child',
     name: 'Aguardando Pareamento...',
@@ -641,11 +745,12 @@ function resolveDeviceFamily(req) {
 
 // Consultado a cada ~60s pelo ParentalAccessibilityService: resposta enxuta, só com
 // o que o nativo precisa pra atualizar a Home e decidir se bloqueia o aparelho.
-app.get('/api/tasks/sync', (req, res) => {
-  const { family } = resolveDeviceFamily(req);
+/** Tudo que o aparelho do filho precisa (ver o comentário da rota abaixo) + uma versão
+ * (hash do conteúdo), usada pelo long-poll pra só responder quando algo mudou de verdade. */
+function buildDeviceSync(family) {
   ensureTasksForToday(family);
   const scheduleBlock = activeScheduleBlock(family);
-  res.json({
+  const payload = {
     unlockMode: family.rules.taskUnlockMode,
     dailyLimitMinutes: computeEffectiveDailyLimitMinutes(family),
     dailyTasks: family.rules.dailyTasks,
@@ -682,6 +787,48 @@ app.get('/api/tasks/sync', (req, res) => {
     // socket.io); sem isso o nativo nunca sincronizava e o botão não tinha como existir
     // de verdade na tela de bloqueio nem na Home (ver LockOverlayService/LauncherHomeActivity).
     emergencyPhone: family.rules.emergencyPhone
+  };
+  const version = crypto.createHash('sha1').update(JSON.stringify(payload)).digest('hex').slice(0, 16);
+  return { payload, version };
+}
+
+const SYNC_MAX_WAIT_SECONDS = 25;
+
+// ?wait=N&v=VERSAO (long-poll): se a versão que o aparelho já tem ainda é a atual, segura
+// a resposta até algo mudar (ou até N segundos, máx. SYNC_MAX_WAIT_SECONDS) — mudanças do
+// pai chegam no filho quase na hora, sem o aparelho precisar consultar a cada poucos
+// segundos. Sem esses parâmetros responde na hora, como antes (versões antigas do app).
+app.get('/api/tasks/sync', (req, res) => {
+  const { family, familyId } = resolveDeviceFamily(req);
+  const respond = () => {
+    const { payload, version } = buildDeviceSync(family);
+    res.json({ ...payload, syncVersion: version });
+  };
+  const waitSeconds = Math.min(Number(req.query.wait) || 0, SYNC_MAX_WAIT_SECONDS);
+  const knownVersion = req.query.v;
+  if (!waitSeconds || !knownVersion || knownVersion !== buildDeviceSync(family).version) return respond();
+
+  if (!syncWaiters.has(familyId)) syncWaiters.set(familyId, new Set());
+  const waiters = syncWaiters.get(familyId);
+  let finished = false;
+  const waiter = {
+    version: knownVersion,
+    finish: () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      waiters.delete(waiter);
+      if (!res.writableEnded) respond();
+    }
+  };
+  // Horário de Dormir/Estudo muda com o relógio, sem nenhum evento — o timeout cobre isso.
+  const timer = setTimeout(waiter.finish, waitSeconds * 1000);
+  waiters.add(waiter);
+  // res (não req): em Node 18+ o 'close' do req dispara assim que o GET termina de chegar.
+  res.on('close', () => {
+    finished = true;
+    clearTimeout(timer);
+    waiters.delete(waiter);
   });
 });
 
@@ -691,8 +838,8 @@ app.get('/api/tasks/sync', (req, res) => {
 app.post('/api/device/reset-usage-ack', (req, res) => {
   const { family, familyId } = resolveDeviceFamily(req);
   family.rules.resetUsageRequested = false;
-  saveDatabase(db);
-  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  saveDatabase();
+  broadcastState(familyId);
   res.json({ success: true });
 });
 
@@ -713,8 +860,9 @@ app.post('/api/device/request-extra-time', (req, res) => {
     status: 'pending'
   };
   family.timeRequests.unshift(newRequest);
-  saveDatabase(db);
-  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  family.timeRequests.length = Math.min(family.timeRequests.length, MAX_TIME_REQUESTS);
+  saveDatabase();
+  broadcastState(familyId);
   io.to(familyRoom(familyId)).emit('notification:new_time_request', newRequest);
   sendPushToFamily(family, {
     title: '⏱️ Pedido de tempo extra',
@@ -739,8 +887,8 @@ app.post('/api/device/location-sync', (req, res) => {
   dev.lastSeen = new Date().toISOString();
   dev.isOnline = true;
   checkGeofenceCrossings(family, dev.location);
-  saveDatabase(db);
-  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  saveDatabase();
+  broadcastState(familyId);
   res.json({ success: true });
 });
 
@@ -807,8 +955,8 @@ app.post('/api/device/telemetry-sync', (req, res) => {
   family.rules.deviceSyncRequested = false;
   dev.lastSeen = new Date().toISOString();
   dev.isOnline = true;
-  saveDatabase(db);
-  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  saveDatabase();
+  broadcastState(familyId);
   res.json({ success: true });
 });
 
@@ -838,8 +986,8 @@ app.post('/api/device/usage-history-sync', (req, res) => {
     .sort((a, b) => a.timestamp - b.timestamp)
     .slice(-MAX_APP_HISTORY_ENTRIES);
 
-  saveDatabase(db);
-  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  saveDatabase();
+  broadcastState(familyId);
   res.json({ success: true });
 });
 
@@ -851,8 +999,8 @@ app.post('/api/device/pin-unlock-ack', (req, res) => {
   const { family, familyId } = resolveDeviceFamily(req);
   family.rules.isPauseAllActive = false;
   family.rules.lastPinUnlockAt = new Date().toISOString();
-  saveDatabase(db);
-  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  saveDatabase();
+  broadcastState(familyId);
 
   // "Break glass": a criança destravou o aparelho sozinha com o PIN de emergência —
   // o pai precisa saber na hora, é exatamente o tipo de evento que essa opção existe
@@ -929,8 +1077,8 @@ app.post('/api/device/apps-sync', (req, res) => {
   reconcileInstalledApps(family, dev, installedApps);
   dev.lastSeen = new Date().toISOString();
   dev.isOnline = true;
-  saveDatabase(db);
-  io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  saveDatabase();
+  broadcastState(familyId);
   res.json({ success: true });
 });
 
@@ -960,9 +1108,9 @@ app.post('/api/tasks/:taskId/submit', (req, res) => {
     item.photoUrl = `/uploads/tasks/${fileName}`;
     item.submittedAt = new Date().toISOString();
     item.rejectedReason = null;
-    saveDatabase(db);
+    saveDatabase();
 
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    broadcastState(familyId);
     io.to(familyRoom(familyId)).emit('notification:new_task_submission', item);
 
     const taskTitle = family.rules.dailyTasks.find(t => t.id === taskId)?.title || 'Tarefa';
@@ -1022,7 +1170,7 @@ io.on('connection', (socket) => {
       createdAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString()
     };
-    saveDatabase(db);
+    saveDatabase();
 
     socket.emit('parent:pair_code_generated', {
       success: true,
@@ -1061,22 +1209,22 @@ io.on('connection', (socket) => {
       }
       dev.lastSeen = new Date().toISOString();
       dev.isOnline = true;
-      saveDatabase(db);
-      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+      saveDatabase();
+      broadcastState(familyId);
     }
   });
 
   // Comandos dos Pais
   socket.on('parent:set_daily_limit', (minutes) => {
     family.rules.dailyLimitMinutes = minutes;
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   socket.on('parent:toggle_pause_all', (isPaused) => {
     family.rules.isPauseAllActive = isPaused;
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // PIN de emergência: só o hash SHA-256 é guardado — o valor em texto puro chega
@@ -1086,8 +1234,8 @@ io.on('connection', (socket) => {
     const cleaned = String(pin || '').trim();
     if (cleaned.length < 4 || cleaned.length > 8) return;
     family.rules.unlockPinHash = crypto.createHash('sha256').update(cleaned).digest('hex');
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // Telefone que o botão "Chamada de Emergência" (tela de bloqueio do Filho) disca
@@ -1095,8 +1243,8 @@ io.on('connection', (socket) => {
   socket.on('parent:set_emergency_phone', (phone) => {
     const cleaned = String(phone || '').trim();
     family.rules.emergencyPhone = cleaned || null;
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // Horário de Dormir/Estudo: bloqueia de verdade (ver activeScheduleBlock/isWithinSchedule)
@@ -1108,24 +1256,24 @@ io.on('connection', (socket) => {
       start: start || current.start,
       end: end || current.end
     };
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // Pede que o aparelho busque uma localização fresca (GPS ativo) no próximo poll,
   // em vez de só reenviar a última posição em cache — ver locationUpdateRequested.
   socket.on('parent:request_location_update', () => {
     family.rules.locationUpdateRequested = true;
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // Botão de sincronizar do header do app do Pai: pede que o nativo reenvie
   // bateria/wifi/modelo no próximo poll (~1min) — ver deviceSyncRequested.
   socket.on('parent:request_device_sync', () => {
     family.rules.deviceSyncRequested = true;
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // Renomear o celular do filho (ex: "Moto G60 (Filho)" -> "Celular do João"). Só o pai
@@ -1138,8 +1286,8 @@ io.on('connection', (socket) => {
     const trimmed = (name || '').trim();
     if (dev && trimmed) {
       dev.name = trimmed.slice(0, 40);
-      saveDatabase(db);
-      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+      saveDatabase();
+      broadcastState(familyId);
     }
   });
 
@@ -1151,16 +1299,16 @@ io.on('connection', (socket) => {
     family.rules.resetUsageRequested = true;
     const dev = Object.values(family.pairedDevices)[0];
     if (dev) dev.usedMinutesToday = 0;
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   socket.on('parent:toggle_app_block', ({ appId, isBlocked }) => {
     const targetApp = family.rules.blockedApps.find(a => a.id === appId);
     if (targetApp) {
       targetApp.isBlocked = isBlocked;
-      saveDatabase(db);
-      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+      saveDatabase();
+      broadcastState(familyId);
     }
   });
 
@@ -1173,16 +1321,16 @@ io.on('connection', (socket) => {
     const targetApp = family.rules.blockedApps.find(a => a.id === appId);
     if (targetApp) {
       targetApp.isAlwaysAvailable = isAlwaysAvailable;
-      saveDatabase(db);
-      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+      saveDatabase();
+      broadcastState(familyId);
     }
   });
 
   socket.on('parent:add_blocked_domain', (domain) => {
     if (domain && !family.rules.contentFilter.blockedDomains.includes(domain)) {
       family.rules.contentFilter.blockedDomains.push(domain);
-      saveDatabase(db);
-      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+      saveDatabase();
+      broadcastState(familyId);
     }
   });
 
@@ -1193,8 +1341,8 @@ io.on('connection', (socket) => {
       if (approved && bonusMinutes) {
         family.rules.dailyLimitMinutes += bonusMinutes;
       }
-      saveDatabase(db);
-      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+      saveDatabase();
+      broadcastState(familyId);
       io.to(familyRoom(familyId)).emit('notification:request_answered', { request: reqItem, approved, bonusMinutes });
     }
   });
@@ -1228,8 +1376,8 @@ io.on('connection', (socket) => {
     // Novo ID a cada concessão — é assim que o nativo percebe "essa é uma liberação NOVA"
     // e zera o progresso local da anterior (ver GuardianPrefs.saveRulesSync).
     family.rules.parentTimeGrantId = Date.now();
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // Cancela uma liberação manual em andamento antes da hora (ex: pai clicou errado, ou
@@ -1240,8 +1388,8 @@ io.on('connection', (socket) => {
     family.rules.parentTimeGrantUsageMinutesTotal = 0;
     family.rules.parentTimeGrantUsageMinutesUsed = 0;
     family.rules.parentTimeGrantId = null;
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   socket.on('child:request_extra_time', ({ reason, requestedMinutes }) => {
@@ -1253,8 +1401,9 @@ io.on('connection', (socket) => {
       status: 'pending'
     };
     family.timeRequests.unshift(newRequest);
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+  family.timeRequests.length = Math.min(family.timeRequests.length, MAX_TIME_REQUESTS);
+    saveDatabase();
+    broadcastState(familyId);
     io.to(familyRoom(familyId)).emit('notification:new_time_request', newRequest);
 
     sendPushToFamily(family, {
@@ -1272,7 +1421,7 @@ io.on('connection', (socket) => {
     if (!Array.isArray(family.rules.pushTokens)) family.rules.pushTokens = [];
     if (!family.rules.pushTokens.includes(token)) {
       family.rules.pushTokens.push(token);
-      saveDatabase(db);
+      saveDatabase();
     }
   });
 
@@ -1284,8 +1433,8 @@ io.on('connection', (socket) => {
     PUSH_NOTIFICATION_TYPES.forEach(type => {
       if (typeof preferences[type] === 'boolean') family.rules.pushPreferences[type] = preferences[type];
     });
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // Pai edita a lista de tarefas do dia e/ou o modo de bloqueio ('off' | 'earn' | 'all_or_nothing')
@@ -1302,8 +1451,8 @@ io.on('connection', (socket) => {
       }));
     }
     syncTaskInstancesWithTemplate(family);
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // Pai cria uma nova cerca virtual ou edita uma existente (upsert por id; sem id = cria)
@@ -1324,15 +1473,15 @@ io.on('connection', (socket) => {
         radiusMeters: Number(radiusMeters) || 150
       });
     }
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // Pai remove uma cerca virtual
   socket.on('parent:remove_geofence', ({ id }) => {
     family.rules.geofences = family.rules.geofences.filter(g => g.id !== id);
-    saveDatabase(db);
-    io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+    saveDatabase();
+    broadcastState(familyId);
   });
 
   // Pai aprova ou recusa uma tarefa enviada pela criança — funciona em qualquer status
@@ -1346,8 +1495,8 @@ io.on('connection', (socket) => {
       item.approvedAt = approved ? new Date().toISOString() : null;
       item.rejectedReason = approved ? null : (rejectedReason || 'Tente novamente.');
       item.snoozeUntil = null; // resolvida — não faz mais sentido continuar "adiada"
-      saveDatabase(db);
-      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+      saveDatabase();
+      broadcastState(familyId);
       io.to(familyRoom(familyId)).emit('notification:task_reviewed', { item, approved });
     }
   });
@@ -1364,8 +1513,8 @@ io.on('connection', (socket) => {
     const mins = Number(minutes);
     if (item && mins > 0) {
       item.snoozeUntil = Date.now() + mins * 60 * 1000;
-      saveDatabase(db);
-      io.to(familyRoom(familyId)).emit('state:update', getFamilyState(family));
+      saveDatabase();
+      broadcastState(familyId);
     }
   });
 });
@@ -1381,9 +1530,9 @@ io.on('connection', (socket) => {
 const DAILY_TASKS_REMINDER_HOUR = 20;
 
 function checkPendingTasksReminders() {
-  const now = new Date();
-  if (now.getHours() !== DAILY_TASKS_REMINDER_HOUR) return;
-  const today = now.toISOString().slice(0, 10);
+  const now = localNow();
+  if (now.hours !== DAILY_TASKS_REMINDER_HOUR) return;
+  const today = now.date;
 
   Object.values(db.families).forEach(family => {
     if (family.rules.tasksReminderSentDate === today) return;
@@ -1394,7 +1543,7 @@ function checkPendingTasksReminders() {
     if (pending.length === 0) return;
 
     family.rules.tasksReminderSentDate = today;
-    saveDatabase(db);
+    saveDatabase();
 
     const titleById = new Map(family.rules.dailyTasks.map(t => [t.id, t.title]));
     const pendingTitles = pending.map(item => titleById.get(item.taskId) || 'Tarefa');
