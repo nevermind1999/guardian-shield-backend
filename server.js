@@ -463,6 +463,16 @@ function grantBonusTime(family, minutes, mode) {
   return true;
 }
 
+/** O que continua bloqueando o filho mesmo com tempo liberado (a liberação não passa por
+ * cima da Pausa Geral nem dos horários de dormir/estudo) — pro app do pai avisar na hora
+ * em vez de deixar o pai achar que liberou. null = nada. */
+function blockStillActive(family) {
+  if (family.rules.isPauseAllActive) return { type: 'pause', label: 'Pausa Geral' };
+  const schedule = activeScheduleBlock(family);
+  if (schedule) return { type: 'schedule', label: schedule.label.replace(/^\S+\s/, ''), endsAt: schedule.endsAt };
+  return null;
+}
+
 /**
  * Responde um pedido de tempo extra. Aprovar libera os minutos como tempo de USO (mesma
  * liberação do "liberar tempo" do pai) — antes só somava no limite diário fixo, que o modo
@@ -480,7 +490,7 @@ function respondTimeRequest(familyId, requestId, approved, bonusMinutes) {
   saveDatabase();
   broadcastState(familyId);
   io.to(familyRoom(familyId)).emit('notification:request_answered', { request: reqItem, approved, bonusMinutes: minutes });
-  return { success: true, status: reqItem.status, minutes: approved ? minutes : 0 };
+  return { success: true, status: reqItem.status, minutes: approved ? minutes : 0, stillBlockedBy: approved ? blockStillActive(family) : null };
 }
 
 // ============================== ENDPOINTS DE CONTA ==============================
@@ -577,6 +587,21 @@ app.post('/api/parent/time-requests/:requestId/respond', (req, res) => {
   if (!payload?.userId || !db.users[payload.userId]) return res.status(401).json({ success: false, message: 'Faça login de novo.' });
   const result = respondTimeRequest(payload.familyId, req.params.requestId, req.body?.approved !== false, req.body?.bonusMinutes);
   res.status(result.success ? 200 : 404).json(result);
+});
+
+/** Liga/desliga a Pausa Geral sem o socket — botão "Desligar Pausa Geral" da notificação
+ * que avisa que o tempo liberado não vale enquanto a pausa estiver ligada. Body: { active }. */
+app.post('/api/parent/pause', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const payload = token && verifyToken(token);
+  if (!payload?.userId || !db.users[payload.userId]) return res.status(401).json({ success: false, message: 'Faça login de novo.' });
+  const family = db.families[payload.familyId];
+  if (!family) return res.status(404).json({ success: false });
+  family.rules.isPauseAllActive = req.body?.active === true;
+  saveDatabase();
+  broadcastState(payload.familyId);
+  res.json({ success: true, isPauseAllActive: family.rules.isPauseAllActive });
 });
 
 /** Usado no boot dos apps do Pai pra decidir se mostra o popup de login/cadastro
@@ -1473,7 +1498,8 @@ io.on('connection', (socket) => {
   });
 
   socket.on('parent:respond_time_request', ({ requestId, approved, bonusMinutes } = {}) => {
-    respondTimeRequest(familyId, requestId, approved, bonusMinutes);
+    const result = respondTimeRequest(familyId, requestId, approved, bonusMinutes);
+    if (result.stillBlockedBy) socket.emit('parent:time_granted_but_blocked', result.stillBlockedBy);
   });
 
   // Pai libera uma quantidade de tempo ESCOLHIDA NA HORA, sem precisar de um pedido
@@ -1497,6 +1523,8 @@ io.on('connection', (socket) => {
     if (grantBonusTime(family, minutes, mode)) {
       saveDatabase();
       broadcastState(familyId);
+      const blocked = blockStillActive(family);
+      if (blocked) socket.emit('parent:time_granted_but_blocked', blocked);
     }
   });
 
