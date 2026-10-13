@@ -443,6 +443,46 @@ function wakeSyncWaiters(familyId) {
   [...waiters].forEach(w => { if (w.version !== version) w.finish(); });
 }
 
+/**
+ * Liberação manual de tempo pelo pai (vale em qualquer modo, inclusive "ganhar tempo com
+ * tarefas", em que o limite diário fixo é ignorado). 'usage' = minutos de USO; 'clock' =
+ * libera até um horário. Devolve false se os minutos forem inválidos.
+ */
+function grantBonusTime(family, minutes, mode) {
+  const mins = Number(minutes);
+  if (!mins || mins <= 0) return false;
+  const isUsageMode = mode === 'usage';
+  family.rules.dailyLimitMinutes += mins; // ainda útil nos modos 'off'/'earn' — ver computeEffectiveDailyLimitMinutes
+  family.rules.parentTimeGrantMode = isUsageMode ? 'usage' : 'clock';
+  family.rules.parentTimeGrantUntil = isUsageMode ? null : Date.now() + mins * 60 * 1000;
+  family.rules.parentTimeGrantUsageMinutesTotal = isUsageMode ? mins : 0;
+  family.rules.parentTimeGrantUsageMinutesUsed = 0;
+  // Novo ID a cada concessão — é assim que o nativo percebe "essa é uma liberação NOVA"
+  // e zera o progresso local da anterior (ver GuardianPrefs.saveRulesSync).
+  family.rules.parentTimeGrantId = Date.now();
+  return true;
+}
+
+/**
+ * Responde um pedido de tempo extra. Aprovar libera os minutos como tempo de USO (mesma
+ * liberação do "liberar tempo" do pai) — antes só somava no limite diário fixo, que o modo
+ * "ganhar tempo com tarefas" ignora, e a criança não ganhava nada. Usado pelo socket e pela
+ * rota HTTP (notificação / Lançador, com o app do pai fechado).
+ */
+function respondTimeRequest(familyId, requestId, approved, bonusMinutes) {
+  const family = db.families[familyId];
+  const reqItem = family?.timeRequests.find(r => r.id === requestId);
+  if (!reqItem) return { success: false, message: 'Pedido não encontrado.' };
+  if (reqItem.status !== 'pending') return { success: true, alreadyAnswered: true, status: reqItem.status };
+  reqItem.status = approved ? 'approved' : 'rejected';
+  const minutes = Number(bonusMinutes) > 0 ? Number(bonusMinutes) : reqItem.requestedMinutes || 15;
+  if (approved) grantBonusTime(family, minutes, 'usage');
+  saveDatabase();
+  broadcastState(familyId);
+  io.to(familyRoom(familyId)).emit('notification:request_answered', { request: reqItem, approved, bonusMinutes: minutes });
+  return { success: true, status: reqItem.status, minutes: approved ? minutes : 0 };
+}
+
 // ============================== ENDPOINTS DE CONTA ==============================
 // Só o app do Pai loga: email+senha ou Google (POST /api/auth/google). Os três devolvem o
 // mesmo token, então o resto do app não sabe por onde a pessoa entrou.
@@ -526,6 +566,17 @@ app.post('/api/auth/google', async (req, res) => {
     user = createUser({ email, passwordHash: null, googleId });
   }
   res.json({ success: true, token: signUserToken(user), email: user.email });
+});
+
+/** Aprovar/negar um pedido de tempo extra sem o socket — pros botões da notificação e do
+ * Lançador, que rodam com o app do pai fechado. Body: { approved, bonusMinutes? }. */
+app.post('/api/parent/time-requests/:requestId/respond', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const payload = token && verifyToken(token);
+  if (!payload?.userId || !db.users[payload.userId]) return res.status(401).json({ success: false, message: 'Faça login de novo.' });
+  const result = respondTimeRequest(payload.familyId, req.params.requestId, req.body?.approved !== false, req.body?.bonusMinutes);
+  res.status(result.success ? 200 : 404).json(result);
 });
 
 /** Usado no boot dos apps do Pai pra decidir se mostra o popup de login/cadastro
@@ -938,7 +989,7 @@ app.post('/api/device/request-extra-time', (req, res) => {
   sendPushToFamily(family, {
     title: '⏱️ Pedido de tempo extra',
     body: `+${newRequest.requestedMinutes} min — "${newRequest.reason}"`,
-    data: { type: 'time_request', requestId: newRequest.id }
+    data: { type: 'time_request', requestId: newRequest.id, minutes: String(newRequest.requestedMinutes) }
   });
   res.json({ success: true, requestId: newRequest.id });
 });
@@ -1421,17 +1472,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('parent:respond_time_request', ({ requestId, approved, bonusMinutes }) => {
-    const reqItem = family.timeRequests.find(r => r.id === requestId);
-    if (reqItem) {
-      reqItem.status = approved ? 'approved' : 'rejected';
-      if (approved && bonusMinutes) {
-        family.rules.dailyLimitMinutes += bonusMinutes;
-      }
-      saveDatabase();
-      broadcastState(familyId);
-      io.to(familyRoom(familyId)).emit('notification:request_answered', { request: reqItem, approved, bonusMinutes });
-    }
+  socket.on('parent:respond_time_request', ({ requestId, approved, bonusMinutes } = {}) => {
+    respondTimeRequest(familyId, requestId, approved, bonusMinutes);
   });
 
   // Pai libera uma quantidade de tempo ESCOLHIDA NA HORA, sem precisar de um pedido
@@ -1451,20 +1493,11 @@ io.on('connection', (socket) => {
   // - 'usage' ("tempo de uso"): só conta enquanto a tela do Filho está ligada de verdade —
   //   o nativo decrementa localmente (ver GuardianPrefs.incrementParentTimeGrantUsageMinuteIfActive),
   //   então o backend não tem "até quando" fixo, só o total concedido.
-  socket.on('parent:grant_bonus_time', ({ minutes, mode }) => {
-    const mins = Number(minutes);
-    if (!mins || mins <= 0) return;
-    const isUsageMode = mode === 'usage';
-    family.rules.dailyLimitMinutes += mins; // ainda útil nos modos 'off'/'earn' — ver computeEffectiveDailyLimitMinutes
-    family.rules.parentTimeGrantMode = isUsageMode ? 'usage' : 'clock';
-    family.rules.parentTimeGrantUntil = isUsageMode ? null : Date.now() + mins * 60 * 1000;
-    family.rules.parentTimeGrantUsageMinutesTotal = isUsageMode ? mins : 0;
-    family.rules.parentTimeGrantUsageMinutesUsed = 0;
-    // Novo ID a cada concessão — é assim que o nativo percebe "essa é uma liberação NOVA"
-    // e zera o progresso local da anterior (ver GuardianPrefs.saveRulesSync).
-    family.rules.parentTimeGrantId = Date.now();
-    saveDatabase();
-    broadcastState(familyId);
+  socket.on('parent:grant_bonus_time', ({ minutes, mode } = {}) => {
+    if (grantBonusTime(family, minutes, mode)) {
+      saveDatabase();
+      broadcastState(familyId);
+    }
   });
 
   // Cancela uma liberação manual em andamento antes da hora (ex: pai clicou errado, ou
@@ -1496,7 +1529,7 @@ io.on('connection', (socket) => {
     sendPushToFamily(family, {
       title: '⏱️ Pedido de tempo extra',
       body: `+${newRequest.requestedMinutes} min — "${newRequest.reason}"`,
-      data: { type: 'time_request', requestId: newRequest.id }
+      data: { type: 'time_request', requestId: newRequest.id, minutes: String(newRequest.requestedMinutes) }
     });
   });
 
