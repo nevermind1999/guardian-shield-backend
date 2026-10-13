@@ -780,10 +780,19 @@ function getFamilyState(family) {
  * recebe 401 { unpaired: true } em qualquer rota — o app do filho esquece o pareamento e
  * tira os bloqueios. Sem token (app antigo) segue no fluxo de sempre. */
 app.use('/api', (req, res, next) => {
+  // Rotas do aparelho do filho exigem o token do pareamento. Antes, sem token caía na
+  // família "legada" — e qualquer pessoa na internet lia/mexia nas regras dela.
+  const isDeviceRoute = req.path.startsWith('/device/') || req.path.startsWith('/tasks/');
   const token = req.headers['x-device-token'] || req.query.deviceToken;
-  if (!token) return next();
+  if (!token) {
+    return isDeviceRoute ? res.status(401).json({ success: false, message: 'Aparelho não pareado.' }) : next();
+  }
   const payload = verifyToken(token);
-  if (payload?.type !== 'device') return next();
+  if (!payload) {
+    // Token que não confere (ex: assinado com um segredo antigo): pareia de novo.
+    return isDeviceRoute ? res.status(401).json({ success: false, unpaired: true, message: 'Pareie este aparelho de novo.' }) : next();
+  }
+  if (payload.type !== 'device') return next();
   const family = db.families[payload.familyId];
   if (!family || !family.pairedDevices[payload.deviceId]) {
     return res.status(401).json({ success: false, unpaired: true, message: 'Este aparelho foi desconectado da conta dos pais.' });
@@ -1206,9 +1215,9 @@ io.use((socket, next) => {
       return next();
     }
   }
-  socket.data.familyId = LEGACY_FAMILY_ID;
-  if (!db.families[LEGACY_FAMILY_ID]) db.families[LEGACY_FAMILY_ID] = familyDefaults();
-  next();
+  // Sem login válido não entra: antes caía na família "legada" com todos os comandos do
+  // pai liberados pra qualquer um.
+  next(new Error('unauthorized'));
 });
 
 io.on('connection', (socket) => {
