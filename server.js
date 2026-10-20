@@ -578,29 +578,155 @@ app.post('/api/auth/google', async (req, res) => {
   res.json({ success: true, token: signUserToken(user), email: user.email });
 });
 
-/** Aprovar/negar um pedido de tempo extra sem o socket — pros botões da notificação e do
- * Lançador, que rodam com o app do pai fechado. Body: { approved, bonusMinutes? }. */
-app.post('/api/parent/time-requests/:requestId/respond', (req, res) => {
+// ============================== INTEGRAÇÕES (Lume no PC) ==============================
+// Apps de fora (o Lume, buscador do Windows) não têm login com Google. Conectam assim:
+// pedem um código pelo email da conta → o código chega como notificação no app do Pai →
+// o app de fora troca o código por um token de integração (1 ano, revogável).
+
+const INTEGRATION_EXPIRES_IN = '365d';
+const LINK_CODE_TTL_MS = 10 * 60 * 1000;
+const linkCodes = new Map(); // email -> { code, userId, name, expiresAt, tries, sentAt }
+
+/** Confere o token de quem chama uma rota do pai. Token de integração precisa estar na
+ * lista da conta (é assim que ele pode ser revogado). Devolve { user, familyId } ou null. */
+function authParent(req) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   const payload = token && verifyToken(token);
-  if (!payload?.userId || !db.users[payload.userId]) return res.status(401).json({ success: false, message: 'Faça login de novo.' });
-  const result = respondTimeRequest(payload.familyId, req.params.requestId, req.body?.approved !== false, req.body?.bonusMinutes);
+  const user = payload?.userId && db.users[payload.userId];
+  if (!user) return null;
+  if (payload.type === 'integration' && !(user.integrations || []).some(i => i.id === payload.jti)) return null;
+  return { user, familyId: payload.familyId, payload };
+}
+
+app.post('/api/integrations/link/start', (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const name = String(req.body?.name || 'Integração').slice(0, 40);
+  const user = Object.values(db.users).find(u => u.email === email);
+  const family = user && db.families[user.familyId];
+  // Mesma resposta exista a conta ou não (não revela quais emails têm conta).
+  const generic = { success: true, message: 'Se a conta existir, o código chegou como notificação no app do Pai.' };
+  if (!user || !family) return res.json(generic);
+  const prev = linkCodes.get(email);
+  if (prev && Date.now() - prev.sentAt < 30 * 1000) return res.status(429).json({ success: false, message: 'Espere 30 segundos para pedir outro código.' });
+  if (!(family.rules.pushTokens || []).length) {
+    return res.status(409).json({ success: false, message: 'O app do Pai não está recebendo notificações neste momento. Abra o app do Pai no celular e tente de novo.' });
+  }
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  linkCodes.set(email, { code, userId: user.id, name, expiresAt: Date.now() + LINK_CODE_TTL_MS, tries: 0, sentAt: Date.now() });
+  sendPushToFamily(family, {
+    title: '🔐 Código para conectar o ' + name,
+    body: `${code} — digite no ${name}. Se não foi você, ignore.`,
+    data: { type: 'integration_code' }
+  });
+  res.json(generic);
+});
+
+app.post('/api/integrations/link/finish', (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const code = String(req.body?.code || '').replace(/\D/g, '');
+  const entry = linkCodes.get(email);
+  if (!entry || entry.expiresAt < Date.now()) {
+    linkCodes.delete(email);
+    return res.status(400).json({ success: false, message: 'Código expirado. Peça outro.' });
+  }
+  if (entry.code !== code) {
+    entry.tries += 1;
+    if (entry.tries >= 5) linkCodes.delete(email);
+    return res.status(401).json({ success: false, message: entry.tries >= 5 ? 'Muitas tentativas. Peça outro código.' : 'Código errado.' });
+  }
+  linkCodes.delete(email);
+  const user = db.users[entry.userId];
+  if (!user) return res.status(404).json({ success: false });
+  const id = 'int-' + crypto.randomBytes(8).toString('hex');
+  user.integrations = (user.integrations || []).concat({ id, name: entry.name, createdAt: new Date().toISOString() }).slice(-20);
+  saveDatabase();
+  const token = jwt.sign({ userId: user.id, familyId: user.familyId, type: 'integration', jti: id }, JWT_SECRET, { expiresIn: INTEGRATION_EXPIRES_IN });
+  res.json({ success: true, token, email: user.email });
+});
+
+/** Desconecta a integração que está chamando (botão "Desconectar" do Lume). */
+app.post('/api/integrations/unlink', (req, res) => {
+  const auth = authParent(req);
+  if (!auth) return res.status(401).json({ success: false });
+  if (auth.payload.type === 'integration') {
+    auth.user.integrations = (auth.user.integrations || []).filter(i => i.id !== auth.payload.jti);
+    saveDatabase();
+  }
+  res.json({ success: true });
+});
+
+/** Resumo para o cartão do Lume: aparelho, tempo de hoje, pausa, liberação ativa e pedidos. */
+app.get('/api/parent/overview', (req, res) => {
+  const auth = authParent(req);
+  if (!auth) return res.status(401).json({ success: false, message: 'Conecte de novo.' });
+  const family = db.families[auth.familyId];
+  if (!family) return res.status(404).json({ success: false });
+  const st = getFamilyState(family);
+  const d = st.deviceInfo, r = family.rules;
+  let grant = null;
+  if (r.parentTimeGrantMode === 'usage' && r.parentTimeGrantId) {
+    const left = (r.parentTimeGrantUsageMinutesTotal || 0) - (r.parentTimeGrantUsageMinutesUsed || 0);
+    if (left > 0) grant = { mode: 'usage', minutesLeft: left, total: r.parentTimeGrantUsageMinutesTotal };
+  } else if (r.parentTimeGrantUntil && r.parentTimeGrantUntil > Date.now()) {
+    grant = { mode: 'clock', minutesLeft: Math.ceil((r.parentTimeGrantUntil - Date.now()) / 60000), until: r.parentTimeGrantUntil };
+  }
+  res.json({
+    success: true,
+    paired: Object.keys(family.pairedDevices).length > 0,
+    child: { name: d.name, model: d.model, battery: d.batteryLevel, online: d.isOnline, lastSeen: d.lastSeen },
+    usage: { usedMinutes: st.screenTime.usedMinutesToday, limitMinutes: st.screenTime.dailyLimitMinutes, mode: r.taskUnlockMode },
+    pause: r.isPauseAllActive,
+    grant,
+    blockedBy: blockStillActive(family),
+    requests: (family.timeRequests || []).filter(x => x.status === 'pending')
+      .map(x => ({ id: x.id, reason: x.reason, minutes: x.requestedMinutes, at: x.timestamp }))
+  });
+});
+
+/** Liberar tempo de uso agora (mesmo efeito do "Liberar tempo" do app do Pai). Body: { minutes } */
+app.post('/api/parent/grant-time', (req, res) => {
+  const auth = authParent(req);
+  if (!auth) return res.status(401).json({ success: false, message: 'Conecte de novo.' });
+  const family = db.families[auth.familyId];
+  if (!family) return res.status(404).json({ success: false });
+  if (!grantBonusTime(family, req.body?.minutes, 'usage')) return res.status(400).json({ success: false, message: 'Minutos inválidos.' });
+  saveDatabase();
+  broadcastState(auth.familyId);
+  res.json({ success: true, stillBlockedBy: blockStillActive(family) });
+});
+
+/** Cancela a liberação de tempo em andamento. */
+app.post('/api/parent/revoke-time', (req, res) => {
+  const auth = authParent(req);
+  if (!auth) return res.status(401).json({ success: false, message: 'Conecte de novo.' });
+  const family = db.families[auth.familyId];
+  if (!family) return res.status(404).json({ success: false });
+  Object.assign(family.rules, { parentTimeGrantUntil: null, parentTimeGrantMode: 'clock', parentTimeGrantUsageMinutesTotal: 0, parentTimeGrantUsageMinutesUsed: 0, parentTimeGrantId: null });
+  saveDatabase();
+  broadcastState(auth.familyId);
+  res.json({ success: true });
+});
+
+/** Aprovar/negar um pedido de tempo extra sem o socket — pros botões da notificação e do
+ * Lançador, que rodam com o app do pai fechado. Body: { approved, bonusMinutes? }. */
+app.post('/api/parent/time-requests/:requestId/respond', (req, res) => {
+  const auth = authParent(req);
+  if (!auth) return res.status(401).json({ success: false, message: 'Faça login de novo.' });
+  const result = respondTimeRequest(auth.familyId, req.params.requestId, req.body?.approved !== false, req.body?.bonusMinutes);
   res.status(result.success ? 200 : 404).json(result);
 });
 
 /** Liga/desliga a Pausa Geral sem o socket — botão "Desligar Pausa Geral" da notificação
  * que avisa que o tempo liberado não vale enquanto a pausa estiver ligada. Body: { active }. */
 app.post('/api/parent/pause', (req, res) => {
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  const payload = token && verifyToken(token);
-  if (!payload?.userId || !db.users[payload.userId]) return res.status(401).json({ success: false, message: 'Faça login de novo.' });
-  const family = db.families[payload.familyId];
+  const auth = authParent(req);
+  if (!auth) return res.status(401).json({ success: false, message: 'Faça login de novo.' });
+  const family = db.families[auth.familyId];
   if (!family) return res.status(404).json({ success: false });
   family.rules.isPauseAllActive = req.body?.active === true;
   saveDatabase();
-  broadcastState(payload.familyId);
+  broadcastState(auth.familyId);
   res.json({ success: true, isPauseAllActive: family.rules.isPauseAllActive });
 });
 
